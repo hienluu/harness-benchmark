@@ -1,0 +1,18 @@
+[project]
+name = "harness-benchmark"
+version = "0.1.0"
+description = "Thin vs. thick agent harness benchmark: controlled head-to-head on shared tools, tasks, model."
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "langgraph>=0.2.0",
+    "langchain-anthropic>=0.2.0",
+    "langchain-core>=0.3.0",
+    "pytest>=8.0.0",
+    "markdown>=3.6",
+    "claude-agent-sdk>=0.1.0",
+    "langsmith>=0.2.0",
+]
+
+[tool.uv]
+package = false

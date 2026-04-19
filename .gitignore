@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# uv / virtualenvs
+.venv/
+venv/
+# note: uv.lock IS committed — it pins the benchmark's exact deps.
+
+# Benchmark outputs — each run_<ts>/ can be large; commit only curated results.
+results/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Claude Code / editors / OS
+.claude/settings.local.json
+.idea/
+.vscode/
+*.swp
+.DS_Store
