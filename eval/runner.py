@@ -226,6 +226,14 @@ def main():
         print_tasks()
         return
 
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        sys.exit(
+            "ERROR: ANTHROPIC_API_KEY is not set.\n"
+            "All three harnesses call the Anthropic API; exiting before "
+            "wasting time materializing scratch dirs.\n"
+            "Fix:  export ANTHROPIC_API_KEY=sk-ant-..."
+        )
+
     all_tasks = load_all()
     if args.tasks != "all":
         wanted = set(args.tasks.split(","))
