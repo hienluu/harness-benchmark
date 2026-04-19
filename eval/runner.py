@@ -22,7 +22,11 @@ from harnesses import claude_sdk, langgraph_h, thin
 from harnesses.common import usd_cost
 from tasks.registry import Task, Trajectory, cleanup, load_all, materialize
 from eval.judge import judge, score_to_normalized
-from eval.tracing import is_enabled as tracing_enabled, run_context
+from eval.tracing import (
+    configure_claude_sdk_tracing,
+    is_enabled as tracing_enabled,
+    run_context,
+)
 
 
 HARNESSES = {
@@ -204,6 +208,8 @@ def main():
     if tracing_enabled():
         project = os.environ.get("LANGSMITH_PROJECT", "(default)")
         print(f"langsmith tracing: ON (project={project})")
+        if not configure_claude_sdk_tracing():
+            print("WARNING: failed to configure Claude SDK tracing")
     else:
         print("langsmith tracing: OFF")
 

@@ -69,3 +69,20 @@ def run_context(**metadata: Any):
             yield run
     except Exception:
         yield None
+
+
+def configure_claude_sdk_tracing() -> bool:
+    """Enable LangSmith's native Claude Agent SDK integration.
+
+    Safe to call unconditionally: no-op when tracing is disabled, and swallows
+    any import/runtime errors so a missing optional dep never breaks a run.
+    Should be called once, at process startup, before the first `query()` call.
+    """
+    if not is_enabled():
+        return False
+    try:
+        from langsmith.integrations.claude_agent_sdk import configure_claude_agent_sdk
+
+        return configure_claude_agent_sdk()
+    except Exception:
+        pass

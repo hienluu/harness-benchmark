@@ -69,8 +69,8 @@ uv run python eval/runner.py --trials 3 --workers 8
 When the env vars are unset, tracing is a complete no-op — no network calls, no import cost at hot path, no behavior change.
 
 **Coverage:**
-- `thin` + `langgraph` — Anthropic client wrapped via `langsmith.wrappers.wrap_anthropic`; full per-call traces.
-- `claude_sdk` — top-level run trace with metadata; the SDK's internal HTTP transport is not wrapped, so individual model calls inside the SDK don't appear as child spans (limitation of the Claude Agent SDK's API surface, not a design choice).
+- `thin` + `langgraph` — Anthropic client wrapped via `langsmith.wrappers.wrap_anthropic`; full per-call traces with token usage attached to each span.
+- `claude_sdk` — uses LangSmith's first-class `configure_claude_agent_sdk()` integration (from the `langsmith[claude-agent-sdk]` extra), called once at runner startup. Traces agent queries, tool invocations, model calls, and MCP server operations natively — no hand-rolled spans. **Caveat:** subagent tool calls aren't captured today (see [langchain-ai/langsmith-sdk#2091](https://github.com/langchain-ai/langsmith-sdk/issues/2091)); the `claude_sdk` harness here doesn't use subagents, so that limitation doesn't apply.
 
 ## Fairness audit
 

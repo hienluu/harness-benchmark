@@ -44,6 +44,7 @@ def run(task: Task, scratch_dir: Path) -> Trajectory:
         resp = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS_PER_CALL,
+            cache_control={"type": "ephemeral"},
             temperature=TEMPERATURE,
             system=system_blocks,
             tools=TOOL_SCHEMAS,

@@ -24,13 +24,13 @@ from typing import Any
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     ResultMessage,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
     create_sdk_mcp_server,
-    query,
     tool,
 )
 
@@ -122,48 +122,65 @@ async def _run_async(task: Task, scratch_dir: Path) -> Trajectory:
         permission_mode="bypassPermissions",
     )
 
+    # The SDK can split a single assistant turn across multiple AssistantMessage
+    # events (e.g. a ThinkingBlock emitted separately from the TextBlock/ToolUseBlock
+    # that follow). They share the same `message_id`. LangSmith's native integration
+    # dedupes on message_id to count one LLM run per turn — we do the same so our
+    # `num_turns` matches what the LangSmith UI shows.
+    seen_message_ids: set[str] = set()
+
     t0 = time.time()
-    async for message in query(prompt=task.prompt, options=options):
-        traj.messages.append({"type": type(message).__name__, "repr": repr(message)[:2000]})
+    # Use ClaudeSDKClient (not top-level query()) because LangSmith's
+    # native integration patches ClaudeSDKClient in place — traces don't flow
+    # from query(). Functionally equivalent for our one-shot pattern: we open
+    # a fresh client per run, send one prompt, drain the response stream.
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query(task.prompt)
+        async for message in client.receive_response():
+            traj.messages.append({"type": type(message).__name__, "repr": repr(message)[:2000]})
 
-        if isinstance(message, AssistantMessage):
-            traj.num_turns += 1
-            for block in message.content:
-                if isinstance(block, ToolUseBlock):
-                    # We only see the tool call here; result comes in UserMessage.
-                    traj.tool_calls.append(
-                        {
-                            "name": _strip_prefix(block.name),
-                            "input": block.input,
-                            "result": None,
-                            "id": block.id,
-                        }
-                    )
-                    if _strip_prefix(block.name) == "finish":
-                        traj.final_answer = (block.input or {}).get("answer", "")
-                elif isinstance(block, TextBlock):
-                    # Keep latest text as a fallback final answer.
-                    if not traj.final_answer:
-                        traj.final_answer = block.text
+            if isinstance(message, AssistantMessage):
+                mid = getattr(message, "message_id", None)
+                if mid is None or mid not in seen_message_ids:
+                    traj.num_turns += 1
+                    if mid is not None:
+                        seen_message_ids.add(mid)
+                for block in message.content:
+                    if isinstance(block, ToolUseBlock):
+                        # We only see the tool call here; result comes in UserMessage.
+                        traj.tool_calls.append(
+                            {
+                                "name": _strip_prefix(block.name),
+                                "input": block.input,
+                                "result": None,
+                                "id": block.id,
+                            }
+                        )
+                        if _strip_prefix(block.name) == "finish":
+                            traj.final_answer = (block.input or {}).get("answer", "")
+                    elif isinstance(block, TextBlock):
+                        # Keep latest text as a fallback final answer.
+                        if not traj.final_answer:
+                            traj.final_answer = block.text
 
-        elif isinstance(message, UserMessage):
-            for block in getattr(message, "content", []) or []:
-                if isinstance(block, ToolResultBlock):
-                    for call in reversed(traj.tool_calls):
-                        if call["id"] == block.tool_use_id and call["result"] is None:
-                            call["result"] = _extract_text(block.content)
-                            break
+            elif isinstance(message, UserMessage):
+                for block in getattr(message, "content", []) or []:
+                    if isinstance(block, ToolResultBlock):
+                        for call in reversed(traj.tool_calls):
+                            if call["id"] == block.tool_use_id and call["result"] is None:
+                                call["result"] = _extract_text(block.content)
+                                break
 
-        elif isinstance(message, ResultMessage):
-            u = getattr(message, "usage", None) or {}
-            if isinstance(u, dict):
-                traj.tokens_in += int(u.get("input_tokens", 0) or 0)
-                traj.tokens_out += int(u.get("output_tokens", 0) or 0)
-                traj.cache_read += int(u.get("cache_read_input_tokens", 0) or 0)
-                traj.cache_write += int(u.get("cache_creation_input_tokens", 0) or 0)
-            if getattr(message, "result", None) and not traj.final_answer:
-                traj.final_answer = str(message.result)
-            traj.stopped_reason = "success" if not message.is_error else "sdk_error"
+            elif isinstance(message, ResultMessage):
+                u = getattr(message, "usage", None) or {}
+                if isinstance(u, dict):
+                    traj.tokens_in += int(u.get("input_tokens", 0) or 0)
+                    traj.tokens_out += int(u.get("output_tokens", 0) or 0)
+                    traj.cache_read += int(u.get("cache_read_input_tokens", 0) or 0)
+                    traj.cache_write += int(u.get("cache_creation_input_tokens", 0) or 0)
+                if getattr(message, "result", None) and not traj.final_answer:
+                    traj.final_answer = str(message.result)
+                traj.stopped_reason = "success" if not message.is_error else "sdk_error"
 
     traj.latency_s = time.time() - t0
     if traj.num_turns >= MAX_ITERS and not traj.final_answer:
