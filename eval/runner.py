@@ -6,6 +6,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -76,7 +77,13 @@ def classify_failure(traj: Trajectory, evaluator_passed: bool) -> str:
     return "unclassified"
 
 
-def run_one(task: Task, harness_name: str, trial_idx: int, out_dir: Path) -> dict:
+def run_one(
+    task: Task,
+    harness_name: str,
+    trial_idx: int,
+    out_dir: Path,
+    keep_scratch: bool = False,
+) -> dict:
     scratch = materialize(task)
     start = time.time()
     try:
@@ -154,6 +161,22 @@ def run_one(task: Task, harness_name: str, trial_idx: int, out_dir: Path) -> dic
 
     task_dir = out_dir / harness_name / task.id
     task_dir.mkdir(parents=True, exist_ok=True)
+
+    if keep_scratch:
+        preserved = task_dir / f"trial_{trial_idx}_scratch"
+        # Replace any stale preserved copy from an earlier rerun with the same out_dir.
+        if preserved.exists():
+            shutil.rmtree(preserved, ignore_errors=True)
+        try:
+            shutil.move(str(scratch), str(preserved))
+            record["scratch_dir"] = str(preserved)
+        except Exception as e:
+            record["scratch_dir"] = None
+            record["scratch_preserve_error"] = f"{type(e).__name__}: {e}"
+            cleanup(scratch)
+    else:
+        record["scratch_dir"] = None
+
     (task_dir / f"trial_{trial_idx}.json").write_text(json.dumps(record, indent=2, default=str))
     (task_dir / f"trial_{trial_idx}.trajectory.json").write_text(
         json.dumps(
@@ -166,7 +189,8 @@ def run_one(task: Task, harness_name: str, trial_idx: int, out_dir: Path) -> dic
         )
     )
 
-    cleanup(scratch)
+    if not keep_scratch:
+        cleanup(scratch)
     return record
 
 
@@ -186,6 +210,15 @@ def main():
         "--list-tasks",
         action="store_true",
         help="Print the task registry and exit (no runs).",
+    )
+    ap.add_argument(
+        "--keep-scratch",
+        action="store_true",
+        help=(
+            "After each trial, move the scratch directory into "
+            "results/run_<ts>/<harness>/<task>/trial_N_scratch/ instead of "
+            "deleting it. Useful for inspecting the code the agent produced."
+        ),
     )
     args = ap.parse_args()
 
@@ -247,9 +280,12 @@ def main():
             f"mode={rec['failure_mode']}"
         )
 
+    if args.keep_scratch:
+        print(f"keep-scratch: ON (preserved under {out_dir}/<harness>/<task>/trial_N_scratch/)")
+
     if args.workers <= 1:
         for i, (task, h, trial) in enumerate(jobs, 1):
-            rec = run_one(task, h, trial, out_dir)
+            rec = run_one(task, h, trial, out_dir, keep_scratch=args.keep_scratch)
             summary.append(rec)
             print(_format_line(rec, i))
     else:
@@ -257,7 +293,7 @@ def main():
         completed = 0
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             futures = {
-                ex.submit(run_one, task, h, trial, out_dir): (task.id, h, trial)
+                ex.submit(run_one, task, h, trial, out_dir, args.keep_scratch): (task.id, h, trial)
                 for (task, h, trial) in jobs
             }
             for fut in as_completed(futures):

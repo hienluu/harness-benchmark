@@ -29,6 +29,10 @@ uv run python eval/runner.py --trials 3 --workers 8
 # Subset harnesses or tasks
 uv run python eval/runner.py --harnesses thin,claude_sdk --tasks code_merge_intervals,tool_csv_mean --trials 1
 
+# Keep each trial's scratch dir around to inspect the code the agent wrote
+uv run python eval/runner.py --tasks code_lru_cache --trials 1 --keep-scratch
+# → results/run_<ts>/<harness>/code_lru_cache/trial_0_scratch/cache.py
+
 # Aggregate the latest run into a markdown report
 uv run python analyze.py
 
@@ -54,6 +58,38 @@ tasks/       10 Task modules under code/, tool_chain/, research/
 eval/        runner.py (matrix execution), judge.py (LLM-as-judge for research)
 analyze.py   aggregation -> markdown report
 ```
+
+## Tasks
+
+Ten tasks across three categories. All tasks share the same six-tool surface (`bash`, `read_file`, `write_file`, `edit_file`, `list_dir`, `finish`) and run in an isolated scratch directory. Run `uv run python eval/runner.py --list-tasks` to see them at a glance.
+
+### Code (4, deterministic pytest scoring)
+Each task ships a buggy or stub source file plus hidden tests; the evaluator runs pytest and passes/fails the trial.
+
+| ID | What the agent must do |
+| --- | --- |
+| `code_merge_intervals` | Fix an off-by-one bug in `merge_intervals` — touching intervals like `[1,4]` + `[4,5]` must merge. |
+| `code_lru_cache` | Implement an `LRUCache` class from its docstring spec; eviction + update-refresh must be correct. |
+| `code_import_chain` | Fix a broken multi-file import chain so `python main.py` prints `20`. |
+| `code_json_parser` | Make `safe_parse` honor its docstring: handle `None`, empty strings, and invalid JSON by returning the default. |
+
+### Tool chain (3, deterministic file-check scoring)
+Multi-step tool sequences; the evaluator inspects files the agent wrote.
+
+| ID | What the agent must do |
+| --- | --- |
+| `tool_find_todos` | Find all `.py` files under `src/` containing `TODO`, write paths (sorted, one per line) to `todos.txt`. |
+| `tool_csv_mean` | Read `data.csv`, compute the mean of the `value` column, write `{"mean": <float>}` to `out.json`. |
+| `tool_rename_symbol` | Rename function `foo` → `bar` across a small package with no references left and `main.py` still passing. |
+
+### Research (3, LLM-judge scoring on a 1-5 rubric)
+Open-ended writing; the judge sees task + final answer only (not the trajectory) to keep outcome evaluation independent of process.
+
+| ID | What the agent must do |
+| --- | --- |
+| `research_compare_specs` | Read three cache specs, write a 150–200 word comparison across consistency, ops burden, cost, use case. |
+| `research_bug_rca` | Given a bug report + stack trace, write a root-cause hypothesis and a 3-5 step fix plan. |
+| `research_rate_limiter` | Design a per-key distributed rate limiter: pseudocode, tradeoffs discussed, one failure mode + mitigation. |
 
 ## Observability (optional)
 
