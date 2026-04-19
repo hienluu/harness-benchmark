@@ -19,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from harnesses import claude_sdk, langgraph_h, thin
+from harnesses import claude_sdk, langgraph_h, langgraph_react, thin
 from harnesses.common import usd_cost
 from tasks.registry import Task, Trajectory, cleanup, load_all, materialize
 from eval.judge import judge, score_to_normalized
@@ -33,6 +33,7 @@ from eval.tracing import (
 HARNESSES = {
     "thin": thin.run,
     "langgraph": langgraph_h.run,
+    "langgraph_react": langgraph_react.run,
     "claude_sdk": claude_sdk.run,
 }
 
@@ -196,7 +197,7 @@ def run_one(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--harnesses", default="thin,langgraph,claude_sdk")
+    ap.add_argument("--harnesses", default="thin,langgraph,langgraph_react,claude_sdk")
     ap.add_argument("--tasks", default="all", help="'all' or comma-separated task ids")
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument(

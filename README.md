@@ -1,11 +1,12 @@
 # Thin vs. Thick Harness Benchmark
 
-A controlled head-to-head comparison of three agent harnesses — raw thin loop, Claude Agent SDK (structured thin), and LangGraph (thick) — on the same tasks, same tools, same model. Answers: does a thick framework-based harness buy you anything over a simple tool loop, or does it just cost tokens and latency? And where does "structured thin" (official SDK defaults) land between those extremes?
+A controlled head-to-head comparison of four agent harnesses — raw thin loop, Claude Agent SDK (structured thin), LangGraph `create_react_agent` (idiomatic thin-in-LangGraph baseline), and a custom thick LangGraph topology (planner/router/executor/reflector) — on the same tasks, same tools, same model. Answers: does a thick framework-based harness buy you anything over a simple tool loop, or does it just cost tokens and latency? And if a thick topology *does* cost more, is the cost attributable to the framework (LangGraph) or to the topology on top of it?
 
 ## Design
 
 - **Thin harness** (`harnesses/thin.py`): Anthropic SDK + while-loop. No framework.
 - **Claude Agent SDK harness** (`harnesses/claude_sdk.py`): structured-thin — Anthropic's official agent SDK with our six custom tools exposed as an in-process MCP server. Built-in SDK tools are explicitly denied.
+- **LangGraph `create_react_agent` harness** (`harnesses/langgraph_react.py`): the prebuilt idiomatic LangGraph agent — a simple LLM → ToolNode loop. Serves as the baseline for "LangGraph as LangGraph wants to be used" so the `langgraph` harness's cost can be split into "framework tax" vs. "our custom topology tax."
 - **Thick harness** (`harnesses/langgraph_h.py`): LangGraph StateGraph with planner → router → executor → reflector nodes.
 - **Shared:** model (`claude-sonnet-4-6`), system prompt, max iterations, tool implementations (`tools/`), task suite, evaluators. The only variable is harness structure. Note: the Claude Agent SDK does not expose `temperature` / `max_tokens` via its options surface, so those fall back to SDK defaults — flagged in the report as an honest structural difference.
 - **Tasks** (10): 4 code fixes (pytest-scored), 3 tool-chain tasks (file-check scored), 3 research tasks (LLM-judge scored).
@@ -19,7 +20,7 @@ This project uses [uv](https://docs.astral.sh/uv/) for dependency and env manage
 # Install deps (creates .venv, writes uv.lock)
 uv sync
 
-# Run the full matrix (3 harnesses × 10 tasks × 3 trials = 90 runs)
+# Run the full matrix (4 harnesses × 10 tasks × 3 trials = 120 runs)
 export ANTHROPIC_API_KEY=sk-ant-...
 uv run python eval/runner.py --trials 3
 
@@ -40,7 +41,7 @@ uv run python analyze.py
 uv run python analyze.py --open
 ```
 
-Harness ids: `thin`, `claude_sdk`, `langgraph`.
+Harness ids: `thin`, `claude_sdk`, `langgraph_react`, `langgraph`.
 
 List all tasks (category, id, first line of prompt):
 ```bash
@@ -52,7 +53,7 @@ Results land in `results/run_<timestamp>/` with per-run `trial_N.json` (metrics)
 ## Layout
 
 ```
-harnesses/   thin.py + claude_sdk.py + langgraph_h.py + common.py (shared constants)
+harnesses/   thin.py + claude_sdk.py + langgraph_react.py + langgraph_h.py + common.py (shared constants)
 tools/       bash.py, fs.py, __init__.py (shared schemas + dispatcher)
 tasks/       10 Task modules under code/, tool_chain/, research/
 eval/        runner.py (matrix execution), judge.py (LLM-as-judge for research)
@@ -106,6 +107,7 @@ When the env vars are unset, tracing is a complete no-op — no network calls, n
 
 **Coverage:**
 - `thin` + `langgraph` — Anthropic client wrapped via `langsmith.wrappers.wrap_anthropic`; full per-call traces with token usage attached to each span.
+- `langgraph_react` — LangChain / LangGraph emit LangSmith spans natively when `LANGSMITH_TRACING=true`; every agent and tool node step is traced without any extra wiring.
 - `claude_sdk` — uses LangSmith's first-class `configure_claude_agent_sdk()` integration (from the `langsmith[claude-agent-sdk]` extra), called once at runner startup. Traces agent queries, tool invocations, model calls, and MCP server operations natively — no hand-rolled spans. **Caveat:** subagent tool calls aren't captured today (see [langchain-ai/langsmith-sdk#2091](https://github.com/langchain-ai/langsmith-sdk/issues/2091)); the `claude_sdk` harness here doesn't use subagents, so that limitation doesn't apply.
 
 ## Fairness audit
@@ -121,3 +123,22 @@ All three harnesses share:
 - `temperature` / `max_tokens`: thin and langgraph are pinned to `temperature=0.0`, `max_tokens=4096`. `ClaudeAgentOptions` in `claude-agent-sdk` 0.1.63 does not expose these, so that harness uses SDK defaults.
 - Built-in tools: the Claude Agent SDK ships with its own `Bash`/`Read`/`Edit`/`WebSearch`/etc. — we deny them via `disallowed_tools` and omit them from `allowed_tools` so the agent can only call our six custom tools. This is enforced by an allowlist, not hard-disabled.
 - `setting_sources=[]` on the Claude SDK harness so user/project `CLAUDE.md` and other settings don't leak into reproducibility.
+
+## TODOs
+
+### Multi-provider harnesses
+
+Extend the benchmark beyond Anthropic-only harnesses so the "thin vs. thick" question can be answered *across* the major frontier model providers, not just within one. For each vendor we'd add a "thin" (raw SDK + tool loop) and a "structured-thin" (official agent framework) harness, slotting them into the existing `(task × harness × trial)` matrix — the shared `tools/`, task suite, evaluators, and runner stay unchanged.
+
+- [ ] **Google: `google-genai` thin harness** — `harnesses/gemini_thin.py`. Uses the `google-genai` Python SDK (`google.genai.Client().models.generate_content(...)`) with a while-loop over Gemini's function-calling format. Map our 6 shared tools to Gemini `FunctionDeclaration` schemas. Pick a Gemini model comparable to Sonnet 4.6 in `harnesses/common.py` (e.g., `gemini-2.5-pro`). Requires `GOOGLE_API_KEY`.
+- [ ] **Google: Gemini ADK harness** — `harnesses/gemini_adk.py`. Uses Google's [Agent Development Kit](https://google.github.io/adk-docs/) (`google-adk` package) — the "structured-thin" analogue to Claude Agent SDK. Register our tools as ADK `Tool`s, run via the ADK's session/runner API, drain events equivalent to our current `AssistantMessage`/`ToolUseBlock`/`ResultMessage` parsing. LangSmith has a native integration (`langsmith[google-adk]`), use that for observability.
+- [ ] **OpenAI: `openai` client thin harness** — `harnesses/openai_thin.py`. Uses the `openai` Python SDK with a while-loop over the Responses API (preferred over chat.completions for better tool-use ergonomics). Map our 6 tools to OpenAI tool schemas. Pin to a capable model (e.g., `gpt-5` or equivalent). Requires `OPENAI_API_KEY`.
+- [ ] **OpenAI: Agents SDK harness** — `harnesses/openai_agents.py`. Uses the [`openai-agents`](https://openai.github.io/openai-agents-python/) Python package — OpenAI's answer to Claude Agent SDK (handoff/routing architecture). Register tools via `@function_tool`, run via `Runner.run(...)`. LangSmith has a native integration (`langsmith[openai-agents]`), use that.
+
+Adding these turns the benchmark into a 3-provider × {thin, structured-thin, thick-graph} grid. The interesting question shifts from "does scaffolding help within Anthropic?" to "does the *same* scaffolding pattern buy more on weaker backbones than on stronger ones, and do different providers' official agent frameworks converge on similar quality/cost tradeoffs?"
+
+### Other follow-ons
+
+- [ ] **Model-size ablation** — rerun the full matrix on a weaker model (e.g., Haiku 4.5 on the Anthropic side) to test the blog's central hypothesis: thick harnesses compensate for weaker models.
+- [ ] **Multi-agent orchestrator harness** — a third "thick" style: orchestrator + specialist subagents (planner, coder, reviewer) delegating via tool-call handoff. Complements LangGraph's single-agent graph.
+- [ ] **Statistical significance** — 3 trials is thin for small deltas. Scale to 10+ once a full matrix costs < $1.
