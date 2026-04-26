@@ -19,23 +19,71 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from harnesses import claude_sdk, langgraph_h, langgraph_react, thin
+# Load .env from the repo root if present. Optional dep; users can also export
+# vars directly. We do this before importing harnesses so OPENAI_BASE_URL etc.
+# are visible when the OpenAI SDK clients are constructed.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(ROOT / ".env")
+except ImportError:
+    pass
+
+from functools import partial
+
+from harnesses import (
+    claude_sdk,
+    langgraph_h,
+    langgraph_react,
+    openai_agents,
+    openai_langgraph_h,
+    openai_langgraph_react,
+    thin,
+)
 from harnesses.common import usd_cost
+from harnesses.openai_common import DEFAULT_OPENAI_MODEL
+from harnesses.providers import SUPPORTED_PROVIDERS, get_provider
+from harnesses.providers.gemini import DEFAULT_GEMINI_MODEL
 from tasks.registry import Task, Trajectory, cleanup, load_all, materialize
 from eval.judge import judge, score_to_normalized
 from eval.tracing import (
     configure_claude_sdk_tracing,
+    configure_openai_agents_tracing,
     is_enabled as tracing_enabled,
     run_context,
 )
 
 
+# `thin` is provider-agnostic — its provider is supplied by --provider at run
+# time (default: anthropic). The other harnesses are provider-pinned because
+# they wrap a provider-specific framework / SDK.
 HARNESSES = {
     "thin": thin.run,
     "langgraph": langgraph_h.run,
     "langgraph_react": langgraph_react.run,
     "claude_sdk": claude_sdk.run,
+    "openai_langgraph": openai_langgraph_h.run,
+    "openai_langgraph_react": openai_langgraph_react.run,
+    "openai_agents": openai_agents.run,
 }
+
+ANTHROPIC_HARNESSES = {"langgraph", "langgraph_react", "claude_sdk"}
+OPENAI_HARNESSES = {
+    "openai_langgraph",
+    "openai_langgraph_react",
+    "openai_agents",
+}
+
+
+def _provider_for(harness_name: str, thin_provider: str) -> str:
+    """Which provider should be used for cost lookup, API-key gating, etc.
+
+    `thin` is provider-agnostic and follows --provider; everything else is
+    pinned to its module's provider.
+    """
+    if harness_name == "thin":
+        return thin_provider
+    return "openai" if harness_name in OPENAI_HARNESSES else "anthropic"
 
 
 def print_tasks() -> None:
@@ -84,17 +132,24 @@ def run_one(
     trial_idx: int,
     out_dir: Path,
     keep_scratch: bool = False,
+    thin_provider: str = "anthropic",
 ) -> dict:
     scratch = materialize(task)
     start = time.time()
+    # `thin` is the only harness that takes a provider arg; everything else
+    # is a fixed-signature run(task, scratch_dir).
+    fn = HARNESSES[harness_name]
+    if harness_name == "thin":
+        fn = partial(fn, provider=thin_provider)
     try:
         with run_context(
             harness=harness_name,
             task_id=task.id,
             trial=trial_idx,
             category=task.category,
+            provider=_provider_for(harness_name, thin_provider),
         ):
-            traj = HARNESSES[harness_name](task, scratch)
+            traj = fn(task, scratch)
         crashed = False
         err = None
     except Exception as e:
@@ -135,6 +190,7 @@ def run_one(
         "task_id": task.id,
         "category": task.category,
         "harness": harness_name,
+        "provider": _provider_for(harness_name, thin_provider),
         "trial": trial_idx,
         "passed": passed,
         "score_normalized": final_score,
@@ -151,7 +207,11 @@ def run_one(
         "cache_read": traj.cache_read,
         "cache_write": traj.cache_write,
         "cost_usd": usd_cost(
-            traj.tokens_in, traj.tokens_out, traj.cache_read, traj.cache_write
+            traj.tokens_in,
+            traj.tokens_out,
+            traj.cache_read,
+            traj.cache_write,
+            provider=_provider_for(harness_name, thin_provider),
         ),
         "stopped_reason": traj.stopped_reason,
         "failure_mode": failure_mode,
@@ -201,6 +261,30 @@ def main():
     ap.add_argument("--tasks", default="all", help="'all' or comma-separated task ids")
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument(
+        "--provider",
+        default="anthropic",
+        choices=list(SUPPORTED_PROVIDERS),
+        help=(
+            "Which LLM provider the `thin` harness uses (default: anthropic). "
+            "Other harnesses are provider-pinned and ignore this flag — "
+            "openai_* harnesses always use OpenAI, claude_sdk always uses "
+            "Anthropic, etc. Use --provider openai with --harnesses thin to "
+            "run the thin pattern against OpenAI / OpenAI-compatible endpoints."
+        ),
+    )
+    ap.add_argument(
+        "--openai-model",
+        default=None,
+        help=(
+            "Model name to use for any OpenAI-backed harness (openai_* and "
+            "`thin --provider openai`). Overrides $OPENAI_MODEL. If neither is "
+            f"set, defaults to {DEFAULT_OPENAI_MODEL!r}. OPENAI_API_KEY and "
+            "OPENAI_BASE_URL come from the .env file (or the process "
+            "environment) so this flag is the only thing you typically change "
+            "to swap models or point at an OpenAI-compatible server."
+        ),
+    )
+    ap.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -227,19 +311,82 @@ def main():
         print_tasks()
         return
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        sys.exit(
-            "ERROR: ANTHROPIC_API_KEY is not set.\n"
-            "All three harnesses call the Anthropic API; exiting before "
-            "wasting time materializing scratch dirs.\n"
-            "Fix:  export ANTHROPIC_API_KEY=sk-ant-..."
-        )
-
     all_tasks = load_all()
     if args.tasks != "all":
         wanted = set(args.tasks.split(","))
         all_tasks = [t for t in all_tasks if t.id in wanted]
     harnesses = args.harnesses.split(",")
+
+    unknown = [h for h in harnesses if h not in HARNESSES]
+    if unknown:
+        sys.exit(
+            f"ERROR: unknown harness(es): {unknown}. "
+            f"Known: {sorted(HARNESSES.keys())}"
+        )
+
+    needs_anthropic = any(h in ANTHROPIC_HARNESSES for h in harnesses)
+    needs_openai = any(h in OPENAI_HARNESSES for h in harnesses)
+    needs_gemini = False
+    # `thin` follows --provider, so its provider also drives key gating.
+    if "thin" in harnesses:
+        # Validate the provider is actually implemented before starting any work.
+        try:
+            get_provider(args.provider)
+        except (NotImplementedError, ValueError) as e:
+            sys.exit(f"ERROR: --provider {args.provider!r}: {e}")
+        if args.provider == "anthropic":
+            needs_anthropic = True
+        elif args.provider == "openai":
+            needs_openai = True
+        elif args.provider == "gemini":
+            needs_gemini = True
+
+    if needs_anthropic and not os.environ.get("ANTHROPIC_API_KEY"):
+        sys.exit(
+            "ERROR: ANTHROPIC_API_KEY is not set, but the selected harnesses "
+            "include Anthropic-backed ones.\n"
+            "Fix:  export ANTHROPIC_API_KEY=sk-ant-...   (or remove those "
+            "harnesses with --harnesses)."
+        )
+    if needs_openai and not os.environ.get("OPENAI_API_KEY"):
+        sys.exit(
+            "ERROR: OPENAI_API_KEY is not set, but the selected harnesses "
+            "include OpenAI-backed ones.\n"
+            "Fix:  add OPENAI_API_KEY=... (and optionally OPENAI_BASE_URL=...) "
+            "to a .env file at the repo root, or export them directly."
+        )
+    if needs_gemini and not (
+        os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    ):
+        sys.exit(
+            "ERROR: GOOGLE_API_KEY (or GEMINI_API_KEY) is not set, but the "
+            "selected run uses --provider gemini.\n"
+            "Fix:  add GOOGLE_API_KEY=... to .env (the google-genai SDK reads "
+            "it automatically — GOOGLE_API_KEY takes precedence if both are set)."
+        )
+
+    # Thread the model selection through env so harnesses (and usd_cost
+    # pricing lookup) read the same value via os.environ["OPENAI_MODEL"].
+    # If we don't materialize the default into the env here, usd_cost sees an
+    # empty string, fails the OPENAI_PRICING prefix match, and reports $0 for
+    # every OpenAI run — even though the harness itself ran fine on the default.
+    if needs_openai:
+        if args.openai_model:
+            os.environ["OPENAI_MODEL"] = args.openai_model
+        elif not os.environ.get("OPENAI_MODEL"):
+            os.environ["OPENAI_MODEL"] = DEFAULT_OPENAI_MODEL
+            print(
+                f"WARNING: --openai-model not set and OPENAI_MODEL not in env; "
+                f"defaulting to {DEFAULT_OPENAI_MODEL!r}."
+            )
+
+    # Same defaulting for Gemini — if GEMINI_MODEL isn't set in .env, materialize
+    # the default into env so usd_cost and the manifest both see the same value.
+    if needs_gemini and not os.environ.get("GEMINI_MODEL"):
+        os.environ["GEMINI_MODEL"] = DEFAULT_GEMINI_MODEL
+        print(
+            f"NOTE: GEMINI_MODEL not in env; defaulting to {DEFAULT_GEMINI_MODEL!r}."
+        )
 
     started_at = dt.datetime.now().astimezone()
     ts = started_at.strftime("%Y%m%d_%H%M%S")
@@ -250,8 +397,10 @@ def main():
     if tracing_enabled():
         project = os.environ.get("LANGSMITH_PROJECT", "(default)")
         print(f"langsmith tracing: ON (project={project})")
-        if not configure_claude_sdk_tracing():
+        if "claude_sdk" in harnesses and not configure_claude_sdk_tracing():
             print("WARNING: failed to configure Claude SDK tracing")
+        if "openai_agents" in harnesses and not configure_openai_agents_tracing():
+            print("WARNING: failed to configure OpenAI Agents SDK tracing")
     else:
         print("langsmith tracing: OFF")
 
@@ -263,6 +412,10 @@ def main():
         "tasks": [t.id for t in all_tasks],
         "trials": args.trials,
         "workers": args.workers,
+        "thin_provider": args.provider if "thin" in harnesses else None,
+        "openai_model": os.environ.get("OPENAI_MODEL") if needs_openai else None,
+        "openai_base_url": os.environ.get("OPENAI_BASE_URL") if needs_openai else None,
+        "gemini_model": os.environ.get("GEMINI_MODEL") if needs_gemini else None,
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
@@ -278,13 +431,17 @@ def main():
     t_wall = time.time()
 
     def _format_line(rec: dict, idx: int) -> str:
+        tin = rec.get("tokens_in", 0) or 0
+        tout = rec.get("tokens_out", 0) or 0
+        prov = rec.get("provider", "?")
         return (
-            f"[{idx}/{total}] {rec['harness']:10} {rec['task_id']:28} "
+            f"[{idx}/{total}] {rec['harness']:10} [{prov:9}] {rec['task_id']:28} "
             f"trial={rec['trial']} "
             f"pass={rec['passed']} "
             f"score={rec['score_normalized']:.2f} "
             f"t={rec['latency_s']:.1f}s "
             f"turns={rec['num_turns']} "
+            f"tok={tin + tout} (in={tin} out={tout}) "
             f"cost=${rec['cost_usd']:.4f} "
             f"mode={rec['failure_mode']}"
         )
@@ -294,7 +451,11 @@ def main():
 
     if args.workers <= 1:
         for i, (task, h, trial) in enumerate(jobs, 1):
-            rec = run_one(task, h, trial, out_dir, keep_scratch=args.keep_scratch)
+            rec = run_one(
+                task, h, trial, out_dir,
+                keep_scratch=args.keep_scratch,
+                thin_provider=args.provider,
+            )
             summary.append(rec)
             print(_format_line(rec, i))
     else:
@@ -302,7 +463,10 @@ def main():
         completed = 0
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             futures = {
-                ex.submit(run_one, task, h, trial, out_dir, args.keep_scratch): (task.id, h, trial)
+                ex.submit(
+                    run_one, task, h, trial, out_dir,
+                    args.keep_scratch, args.provider,
+                ): (task.id, h, trial)
                 for (task, h, trial) in jobs
             }
             for fut in as_completed(futures):

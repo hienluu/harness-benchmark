@@ -37,6 +37,33 @@ def wrap_anthropic_client(client: Any) -> Any:
         return client
 
 
+def wrap_openai_client(client: Any) -> Any:
+    """Wrap an OpenAI SDK client so every `chat.completions.create` call shows
+    up as a trace with token usage and latency. No-op when tracing is disabled."""
+    if not is_enabled():
+        return client
+    try:
+        from langsmith.wrappers import wrap_openai
+
+        return wrap_openai(client)
+    except Exception:
+        return client
+
+
+def wrap_gemini_client(client: Any) -> Any:
+    """Wrap a google-genai Client so every `models.generate_content` call shows
+    up as a trace with token usage, tool calls, and latency. No-op when tracing
+    is disabled. Requires langsmith >= 0.4.33 (the wrapper is in beta)."""
+    if not is_enabled():
+        return client
+    try:
+        from langsmith.wrappers import wrap_gemini
+
+        return wrap_gemini(client)
+    except Exception:
+        return client
+
+
 def traced(name: str | None = None, tags: list[str] | None = None) -> Callable:
     """Decorator: trace a function as a LangSmith run when enabled."""
     def deco(fn: Callable) -> Callable:
@@ -86,3 +113,26 @@ def configure_claude_sdk_tracing() -> bool:
         return configure_claude_agent_sdk()
     except Exception:
         pass
+
+
+def configure_openai_agents_tracing() -> bool:
+    """Enable LangSmith's native OpenAI Agents SDK integration.
+
+    Installs `OpenAIAgentsTracingProcessor` as the Agents SDK's trace processor
+    so every Runner.run produces a nested LangSmith trace covering model calls,
+    tool calls, and handoffs.
+
+    Safe to call unconditionally: no-op when tracing is disabled, and swallows
+    any import/runtime errors so a missing optional dep never breaks a run.
+    Should be called once, at process startup, before the first `Runner.run`.
+    """
+    if not is_enabled():
+        return False
+    try:
+        from agents import set_trace_processors
+        from langsmith.wrappers import OpenAIAgentsTracingProcessor
+
+        set_trace_processors([OpenAIAgentsTracingProcessor()])
+        return True
+    except Exception:
+        return False

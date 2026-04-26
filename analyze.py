@@ -26,6 +26,16 @@ def fmt_row(cells: list[str]) -> str:
     return "| " + " | ".join(cells) + " |"
 
 
+def _human_tokens(n: float) -> str:
+    """Compact human-readable token counts: 1234 -> 1.2k, 1_500_000 -> 1.5M."""
+    n = float(n or 0)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return f"{n:.0f}"
+
+
 def _load_manifest(run_dir: Path) -> dict:
     mp = run_dir / "manifest.json"
     if mp.exists():
@@ -39,9 +49,25 @@ def _load_manifest(run_dir: Path) -> dict:
 def report(run_dir: Path) -> str:
     rows = load_summary(run_dir)
     manifest = _load_manifest(run_dir)
-    harnesses = sorted({r["harness"] for r in rows})
+    # Group by (harness, provider) so re-running `thin` against multiple
+    # providers (and concatenating summary.jsonl files) shows up as separate
+    # rows. Records without a `provider` field (older runs) fall back to "?".
+    pairs = sorted({(r["harness"], r.get("provider", "?")) for r in rows})
     categories = sorted({r["category"] for r in rows})
     tasks = sorted({r["task_id"] for r in rows})
+
+    # The common case is a single-provider run — labels and columns stay clean.
+    # Only when the same harness appears with multiple providers (e.g. someone
+    # concatenated summary.jsonl from runs with different --provider flags) do
+    # we add a "(provider)" suffix to disambiguate.
+    providers_per_harness: dict[str, set[str]] = defaultdict(set)
+    for r in rows:
+        providers_per_harness[r["harness"]].add(r.get("provider", "?"))
+
+    def _label(harness: str, provider: str) -> str:
+        if len(providers_per_harness[harness]) > 1:
+            return f"{harness} ({provider})"
+        return harness
 
     out: list[str] = []
     out.append(f"# Benchmark Report — {run_dir.name}\n")
@@ -56,7 +82,36 @@ def report(run_dir: Path) -> str:
     if "workers" in manifest:
         out.append(f"- **Workers:** {manifest['workers']}")
     out.append(f"- **Trials per (harness, task):** {manifest.get('trials', '?')}")
-    out.append(f"- **Total runs:** {len(rows)}\n")
+    out.append(f"- **Total runs:** {len(rows)}")
+
+    # Provider summary: single line for the common case; grouped breakdown
+    # when a single run mixes providers (or summary.jsonl was concatenated).
+    # Suppress entirely for legacy runs that don't have a provider field.
+    known_providers = sorted(
+        {r.get("provider", "?") for r in rows} - {"?"}
+    )
+    if len(known_providers) == 1:
+        line = f"- **Provider:** {known_providers[0]}"
+        # Surface the model name when we can — comes from the run's manifest
+        # (set by the runner when --provider is the matching one).
+        if known_providers[0] == "openai" and manifest.get("openai_model"):
+            line += f" ({manifest['openai_model']})"
+        elif known_providers[0] == "gemini" and manifest.get("gemini_model"):
+            line += f" ({manifest['gemini_model']})"
+        out.append(line)
+    elif known_providers:
+        # Mixed providers — group harnesses by provider so it's easy to see
+        # who used what.
+        by_prov: dict[str, set[str]] = defaultdict(set)
+        for r in rows:
+            p = r.get("provider")
+            if p:
+                by_prov[p].add(r["harness"])
+        breakdown = "; ".join(
+            f"**{p}** ({', '.join(sorted(by_prov[p]))})" for p in known_providers
+        )
+        out.append(f"- **Providers:** {breakdown}")
+    out.append("")
 
     # ---- Overall per-harness table ----
     out.append("## Overall per-harness metrics\n")
@@ -69,28 +124,37 @@ def report(run_dir: Path) -> str:
                 "p50 latency (s)",
                 "p95 latency (s)",
                 "Mean turns",
+                "Mean tokens (in/out)",
+                "Total tokens",
                 "Mean cost ($)",
                 "Total cost ($)",
             ]
         )
     )
-    out.append(fmt_row(["---"] * 8))
-    for h in harnesses:
-        hr = [r for r in rows if r["harness"] == h]
+    out.append(fmt_row(["---"] * 10))
+    for h, prov in pairs:
+        hr = [r for r in rows if r["harness"] == h and r.get("provider", "?") == prov]
         passes = sum(1 for r in hr if r["passed"])
         scores = [r["score_normalized"] for r in hr]
         lats = sorted(r["latency_s"] for r in hr)
         costs = [r["cost_usd"] for r in hr]
         turns = [r["num_turns"] for r in hr]
+        tin = [r.get("tokens_in", 0) or 0 for r in hr]
+        tout = [r.get("tokens_out", 0) or 0 for r in hr]
+        mean_in = statistics.mean(tin) if tin else 0
+        mean_out = statistics.mean(tout) if tout else 0
+        total_tokens = sum(tin) + sum(tout)
         out.append(
             fmt_row(
                 [
-                    h,
+                    _label(h, prov),
                     f"{passes}/{len(hr)} ({100*passes/len(hr):.0f}%)",
                     f"{statistics.mean(scores):.2f}",
                     f"{lats[len(lats)//2]:.1f}",
                     f"{lats[int(len(lats)*0.95)] if lats else 0:.1f}",
                     f"{statistics.mean(turns):.1f}",
+                    f"{_human_tokens(mean_in)} / {_human_tokens(mean_out)}",
+                    _human_tokens(total_tokens),
                     f"{statistics.mean(costs):.4f}",
                     f"{sum(costs):.3f}",
                 ]
@@ -99,13 +163,17 @@ def report(run_dir: Path) -> str:
     out.append("")
 
     # ---- Per category pass rate ----
+    labels = [_label(h, p) for h, p in pairs]
     out.append("## Pass rate by category\n")
-    out.append(fmt_row(["Category"] + harnesses))
-    out.append(fmt_row(["---"] * (len(harnesses) + 1)))
+    out.append(fmt_row(["Category"] + labels))
+    out.append(fmt_row(["---"] * (len(pairs) + 1)))
     for c in categories:
         cells = [c]
-        for h in harnesses:
-            hr = [r for r in rows if r["harness"] == h and r["category"] == c]
+        for h, prov in pairs:
+            hr = [
+                r for r in rows
+                if r["harness"] == h and r.get("provider", "?") == prov and r["category"] == c
+            ]
             if not hr:
                 cells.append("-")
                 continue
@@ -116,36 +184,61 @@ def report(run_dir: Path) -> str:
 
     # ---- Per task detail ----
     out.append("## Per-task results\n")
-    out.append(fmt_row(["Task"] + [f"{h} pass" for h in harnesses] + [f"{h} turns" for h in harnesses] + [f"{h} cost$" for h in harnesses]))
-    out.append(fmt_row(["---"] * (1 + 3 * len(harnesses))))
+    out.append(
+        fmt_row(
+            ["Task"]
+            + [f"{lbl} pass" for lbl in labels]
+            + [f"{lbl} turns" for lbl in labels]
+            + [f"{lbl} tokens" for lbl in labels]
+            + [f"{lbl} cost$" for lbl in labels]
+        )
+    )
+    out.append(fmt_row(["---"] * (1 + 4 * len(pairs))))
+
+    def _select(t: str, h: str, prov: str) -> list[dict]:
+        return [
+            r for r in rows
+            if r["task_id"] == t and r["harness"] == h and r.get("provider", "?") == prov
+        ]
+
     for t in tasks:
         cells = [t]
-        for h in harnesses:
-            tr = [r for r in rows if r["task_id"] == t and r["harness"] == h]
+        for h, prov in pairs:
+            tr = _select(t, h, prov)
             passes = sum(1 for r in tr if r["passed"])
-            cells.append(f"{passes}/{len(tr)}")
-        for h in harnesses:
-            tr = [r for r in rows if r["task_id"] == t and r["harness"] == h]
+            cells.append(f"{passes}/{len(tr)}" if tr else "-")
+        for h, prov in pairs:
+            tr = _select(t, h, prov)
             turns = [r["num_turns"] for r in tr] or [0]
-            cells.append(f"{statistics.mean(turns):.1f}")
-        for h in harnesses:
-            tr = [r for r in rows if r["task_id"] == t and r["harness"] == h]
+            cells.append(f"{statistics.mean(turns):.1f}" if tr else "-")
+        for h, prov in pairs:
+            tr = _select(t, h, prov)
+            toks = [
+                (r.get("tokens_in", 0) or 0) + (r.get("tokens_out", 0) or 0)
+                for r in tr
+            ] or [0]
+            cells.append(_human_tokens(statistics.mean(toks)) if tr else "-")
+        for h, prov in pairs:
+            tr = _select(t, h, prov)
             costs = [r["cost_usd"] for r in tr] or [0.0]
-            cells.append(f"{statistics.mean(costs):.4f}")
+            cells.append(f"{statistics.mean(costs):.4f}" if tr else "-")
         out.append(fmt_row(cells))
     out.append("")
 
     # ---- Failure mode breakdown ----
     out.append("## Failure mode breakdown\n")
     modes = sorted({r["failure_mode"] for r in rows})
-    out.append(fmt_row(["Failure mode"] + harnesses))
-    out.append(fmt_row(["---"] * (len(harnesses) + 1)))
+    out.append(fmt_row(["Failure mode"] + labels))
+    out.append(fmt_row(["---"] * (len(pairs) + 1)))
     for m in modes:
         cells = [m]
-        for h in harnesses:
-            hr = [r for r in rows if r["harness"] == h]
+        for h, prov in pairs:
+            hr = [
+                r for r in rows
+                if r["harness"] == h and r.get("provider", "?") == prov
+            ]
             c = sum(1 for r in hr if r["failure_mode"] == m)
-            cells.append(f"{c}/{len(hr)}")
+            cells.append(f"{c}/{len(hr)}" if hr else "-")
         out.append(fmt_row(cells))
     out.append("")
 
@@ -156,12 +249,15 @@ def report(run_dir: Path) -> str:
     )
     out.append(fmt_row(["Harness"] + tool_names))
     out.append(fmt_row(["---"] * (1 + len(tool_names))))
-    for h in harnesses:
-        hr = [r for r in rows if r["harness"] == h]
-        cells = [h]
+    for (h, prov), lbl in zip(pairs, labels):
+        hr = [
+            r for r in rows
+            if r["harness"] == h and r.get("provider", "?") == prov
+        ]
+        cells = [lbl]
         for tn in tool_names:
             vals = [(r.get("tool_counts") or {}).get(tn, 0) for r in hr]
-            cells.append(f"{statistics.mean(vals):.1f}")
+            cells.append(f"{statistics.mean(vals):.1f}" if vals else "-")
         out.append(fmt_row(cells))
     out.append("")
 
@@ -172,26 +268,32 @@ def report(run_dir: Path) -> str:
         "then on mean cost as a tiebreaker."
     )
     out.append("")
-    if len(harnesses) == 2:
-        h1, h2 = harnesses
+    if len(pairs) == 2:
+        (h1, p1_prov), (h2, p2_prov) = pairs
+        l1, l2 = labels
         wins = Counter()
         for t in tasks:
-            def stat(h):
-                tr = [r for r in rows if r["task_id"] == t and r["harness"] == h]
+            def stat(h, prov):
+                tr = [
+                    r for r in rows
+                    if r["task_id"] == t
+                    and r["harness"] == h
+                    and r.get("provider", "?") == prov
+                ]
                 p = sum(1 for r in tr if r["passed"]) / max(1, len(tr))
                 cost = statistics.mean([r["cost_usd"] for r in tr] or [0])
                 return p, cost
-            p1, c1 = stat(h1)
-            p2, c2 = stat(h2)
-            if p1 > p2:
-                wins[h1] += 1
-            elif p2 > p1:
-                wins[h2] += 1
+            pa, ca = stat(h1, p1_prov)
+            pb, cb = stat(h2, p2_prov)
+            if pa > pb:
+                wins[l1] += 1
+            elif pb > pa:
+                wins[l2] += 1
             else:
-                if c1 < c2:
-                    wins[f"{h1} (tiebreak)"] += 1
-                elif c2 < c1:
-                    wins[f"{h2} (tiebreak)"] += 1
+                if ca < cb:
+                    wins[f"{l1} (tiebreak)"] += 1
+                elif cb < ca:
+                    wins[f"{l2} (tiebreak)"] += 1
                 else:
                     wins["tie"] += 1
         for k, v in wins.most_common():

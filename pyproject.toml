@@ -2,6 +2,9 @@
 name = "harness-benchmark"
 version = "0.1.0"
 description = "Thin vs. thick agent harness benchmark: controlled head-to-head on shared tools, tasks, model."
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Hien Luu" }]
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.40.0",
@@ -12,7 +15,12 @@ dependencies = [
     "pytest>=8.0.0",
     "markdown>=3.6",
     "claude-agent-sdk>=0.1.0",
-    "langsmith[claude-agent-sdk]>=0.2.0",
+    "langsmith[claude-agent-sdk,openai-agents]>=0.2.0",
+    "openai>=1.50.0",
+    "langchain-openai>=0.2.0",
+    "openai-agents>=0.1.0",
+    "python-dotenv>=1.0.0",
+    "google-genai>=0.3.0",
 ]
 
 [tool.uv]
