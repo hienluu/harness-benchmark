@@ -275,12 +275,11 @@ def main():
         "--openai-model",
         default=None,
         help=(
-            "Model name to use for any OpenAI-backed harness (openai_* and "
-            "`thin --provider openai`). Overrides $OPENAI_MODEL. If neither is "
-            f"set, defaults to {DEFAULT_OPENAI_MODEL!r}. OPENAI_API_KEY and "
-            "OPENAI_BASE_URL come from the .env file (or the process "
-            "environment) so this flag is the only thing you typically change "
-            "to swap models or point at an OpenAI-compatible server."
+            "Model name to use when --provider openai. Overrides $OPENAI_MODEL. "
+            f"If neither is set, defaults to {DEFAULT_OPENAI_MODEL!r}. "
+            "OPENAI_API_KEY and OPENAI_BASE_URL come from the .env file (or the "
+            "process environment) so this flag is the only thing you typically "
+            "change to swap models or point at an OpenAI-compatible server."
         ),
     )
     ap.add_argument(

@@ -3,17 +3,17 @@
 Licensed under the [Apache License 2.0](LICENSE).
 
 
-A controlled head-to-head comparison of agent harnesses — raw thin loop, Claude Agent SDK (structured thin), LangGraph `create_react_agent` (idiomatic thin-in-LangGraph baseline), and a custom thick LangGraph topology (planner/router/executor/reflector) — on the same tasks, same tools, same model. Answers: does a thick framework-based harness buy you anything over a simple tool loop, or does it just cost tokens and latency? And if a thick topology *does* cost more, is the cost attributable to the framework (LangGraph) or to the topology on top of it?
+A controlled head-to-head comparison of agent harnesses — raw thin loop, official agent SDK (structured thin), LangGraph `create_agent` (idiomatic thin-in-LangGraph baseline), and a custom thick LangGraph topology (planner/router/executor/reflector) — on the same tasks, same tools, same model within a single run. Answers: does a thick framework-based harness buy you anything over a simple tool loop, or does it just cost tokens and latency? And if a thick topology *does* cost more, is the cost attributable to the framework (LangGraph) or to the topology on top of it?
 
-Each harness exists in two flavors — Anthropic-backed (Claude) and OpenAI-backed. The OpenAI flavor uses the OpenAI Chat Completions API, so it works against any OpenAI-compatible server (vLLM, Ollama, OpenRouter, Together, LM Studio, …) — letting the same matrix run against open-source models without code changes. Mix and match harnesses across providers in a single run.
+**Every harness is provider-agnostic.** Pick the LLM backend with `--provider {anthropic,openai,gemini}`. The OpenAI provider uses the Chat Completions API, so it works against any OpenAI-compatible server (vLLM, Ollama, OpenRouter, Together, LM Studio, …) — letting the same matrix run against open-source models with no code changes. The thin/langgraph/langgraph_react/ai_agent files share a `Provider` abstraction (`harnesses/providers/`) plus tiny per-harness dispatchers, so adding a fourth provider is one new file. To compare *across* providers, do separate runs and concatenate the resulting `summary.jsonl`s — `analyze.py` will surface them side-by-side.
 
 ## Design
 
 - **Thin harness** (`harnesses/thin.py`): provider-agnostic SDK + while-loop. No framework. Provider is selected with `--provider {anthropic,openai,gemini}`; the format-specific bits live in `harnesses/providers/`. To add a new provider, drop in `harnesses/providers/<name>.py`.
 - **Structured-thin harness** (`harnesses/ai_agent.py`): provider-agnostic dispatcher that routes to the matching official agent SDK based on `--provider` — `claude-agent-sdk` (anthropic) or `openai-agents` (openai). The actual SDK-specific implementations live in `claude_sdk.py` and `openai_agents.py`; `ai_agent.py` just picks one. Built-in SDK tools are explicitly denied where applicable.
-- **LangGraph prebuilt harness** (`harnesses/langgraph_react.py`): the prebuilt idiomatic LangGraph agent (`create_agent`) — a simple LLM → ToolNode loop. Provider-agnostic via `--provider` (anthropic / openai); LangChain handles message format and tool schemas, the harness just picks the right `ChatX` class. Serves as the baseline for "LangGraph as LangGraph wants to be used" so the thick harness's cost can be split into "framework tax" vs. "our custom topology tax."
+- **LangGraph prebuilt harness** (`harnesses/langgraph_react.py`): the prebuilt idiomatic LangGraph agent (`create_agent`) — a simple LLM → ToolNode loop. Provider-agnostic via `--provider` (anthropic / openai today; gemini requires the optional `langchain-google-genai` dep); LangChain handles message format and tool schemas, the harness just picks the right `ChatX` class. Serves as the baseline for "LangGraph as LangGraph wants to be used" so the thick harness's cost can be split into "framework tax" vs. "our custom topology tax."
 - **Thick harness** (`harnesses/langgraph_h.py`): LangGraph StateGraph with planner → router → executor → reflector nodes. Provider-agnostic via `--provider`; every node calls the LLM through the same `Provider` abstraction `thin.py` uses, so the only thing that changes between providers is which SDK call gets made under the hood.
-- **Shared:** model (`claude-sonnet-4-6`), system prompt, max iterations, tool implementations (`tools/`), task suite, evaluators. The only variable is harness structure. Note: the Claude Agent SDK does not expose `temperature` / `max_tokens` via its options surface, so those fall back to SDK defaults — flagged in the report as an honest structural difference.
+- **Shared within a run:** model (per-provider default — `claude-sonnet-4-6` for anthropic, `--openai-model` for openai, `GEMINI_MODEL` env for gemini), system prompt, max iterations, tool implementations (`tools/`), task suite, evaluators. The only variable is harness structure. Note: the Claude Agent SDK does not expose `temperature` / `max_tokens` via its options surface, so the `ai_agent --provider anthropic` path falls back to SDK defaults — flagged in the report as an honest structural difference.
 - **Tasks** (10): 4 code fixes (pytest-scored), 3 tool-chain tasks (file-check scored), 3 research tasks (LLM-judge scored).
 - **Metrics:** pass rate, latency, token cost (with prompt caching), num turns, tool-call mix, failure-mode breakdown.
 
@@ -26,8 +26,10 @@ This project uses [uv](https://docs.astral.sh/uv/) for dependency and env manage
 uv sync
 
 # Configure secrets in .env (see .env.example for the full template).
-# At minimum: ANTHROPIC_API_KEY for the Anthropic harnesses, OPENAI_API_KEY
-# for the OpenAI ones, and (optionally) LANGSMITH_* for tracing.
+# At minimum: ANTHROPIC_API_KEY for --provider anthropic, OPENAI_API_KEY for
+# --provider openai, GOOGLE_API_KEY for --provider gemini, and optionally
+# LANGSMITH_* for tracing. Research tasks always need ANTHROPIC_API_KEY (the
+# LLM-as-judge is pinned to Anthropic for cross-provider scoring consistency).
 cp .env.example .env && $EDITOR .env
 
 # Run the default Anthropic matrix (4 harnesses × 10 tasks × 3 trials = 120 runs)
@@ -61,7 +63,7 @@ Configuration lives in a `.env` file at the repo root (read automatically via `p
 OPENAI_API_KEY=sk-...
 OPENAI_BASE_URL=https://api.openai.com/v1     # default — omit for OpenAI proper
 
-# Run the four OpenAI-pinned harnesses + the thin harness pointed at OpenAI
+# Run all four harnesses against OpenAI
 uv run python eval/runner.py \
   --harnesses thin,ai_agent,langgraph_react,langgraph \
   --provider openai \
@@ -80,7 +82,7 @@ uv run python eval/runner.py --harnesses thin --provider openai --openai-model q
 # vLLM, OpenRouter, Together, LM Studio, ... — same shape
 ```
 
-The thin harness is the same code in both cases — only `--provider` swaps the backend. Each harness reports tokens, latency, and cost (Anthropic prices applied to Anthropic-backed runs, OpenAI prices applied to OpenAI-backed runs; self-hosted/unknown OpenAI models report cost = 0).
+Same code in every case — only `--provider` (and for OpenAI, `OPENAI_BASE_URL` + `--openai-model`) swaps the backend. Each trial reports tokens, latency, and cost; pricing is provider-aware (Anthropic prices for anthropic runs, OpenAI prices for openai runs, Gemini prices for gemini runs; self-hosted / unknown models report cost = 0). The provider used for the run shows up in the report header (e.g. `**Provider:** openai (gpt-5)`).
 
 ### Gemini
 
@@ -107,7 +109,11 @@ List all tasks (category, id, first line of prompt):
 uv run python eval/runner.py --list-tasks
 ```
 
-Results land in `results/run_<timestamp>/` with per-run `trial_N.json` (metrics) and `trial_N.trajectory.json` (full message history).
+Results land in `results/run_<timestamp>/` with `manifest.json` (run config — harnesses, provider, models, base URL), `summary.jsonl` (one row per trial), and per-trial `trial_N.json` + `trial_N.trajectory.json` (full message history). `analyze.py` reads these and emits `report.md` with:
+- A header showing the provider and model in use (e.g. `**Provider:** openai (gpt-5)`).
+- Per-harness aggregates: pass rate, p50/p95 latency, mean turns, mean tokens (in/out), total tokens, mean / total cost.
+- Per-task and per-failure-mode breakdowns.
+- The provider name is also included on every per-trial JSON record so concatenated runs (cross-provider comparisons) render correctly.
 
 ## Layout
 
@@ -185,24 +191,24 @@ When `LANGSMITH_TRACING` is unset (or falsy), tracing is a complete no-op — no
 
 ## Fairness audit
 
-All harnesses share:
-- `harnesses/common.py::MODEL` — same Anthropic model (`claude-sonnet-4-6`) for the four Anthropic harnesses. The four OpenAI harnesses use whatever the user picks via `--openai-model` / `OPENAI_MODEL`. **Cross-provider comparisons are not "controlled" in the way same-provider comparisons are** — they're a different kind of measurement (capability comparison rather than harness-overhead comparison).
-- `harnesses/common.py::SYSTEM_PROMPT` — same base system prompt across all eight harnesses. The thick LangGraph harness prepends node-specific roles (planner, executor, reflector, finalizer) on top; that extra scaffolding *is* the point of the comparison.
-- `tools/` — identical tool implementations and schemas. The Claude Agent SDK harness exposes them as an in-process MCP server (`mcp__hb__*`); the OpenAI Agents SDK harness exposes them as `@function_tool` functions; the other six use native tool-use format for their respective providers. The underlying `tools.execute()` dispatcher is the same for all eight.
-- `harnesses/common.py::MAX_ITERS` — same model-call budget (mapped to `max_turns` in the Claude SDK and OpenAI Agents harnesses).
-- Prompt caching on the system prompt for thin and langgraph (Anthropic flavors); the Claude SDK handles caching on its own. OpenAI does not expose a comparable explicit-cache primitive in the API surface used here, so the OpenAI harnesses report `cache_write = 0` always and `cache_read` only when the official OpenAI API auto-caches inputs (most OpenAI-compatible servers omit this field).
-- The LLM-as-judge for research tasks (`eval/judge.py`) is intentionally pinned to Anthropic / `MODEL` regardless of which harness produced the answer — a single judge keeps cross-provider rubric scoring consistent. Requires `ANTHROPIC_API_KEY` even in OpenAI-only runs that include research tasks.
+All four harnesses in a single run share:
+- **Model.** All harnesses in a given run use the same model — `claude-sonnet-4-6` for `--provider anthropic` (from `harnesses/common.py::MODEL`), the value of `--openai-model` / `OPENAI_MODEL` for `--provider openai`, and `GEMINI_MODEL` for `--provider gemini`. **Cross-provider comparisons are not "controlled" in the way same-provider comparisons are** — they're a different kind of measurement (capability comparison rather than harness-overhead comparison).
+- **System prompt.** Same `harnesses/common.py::SYSTEM_PROMPT` across all four. The thick LangGraph harness prepends node-specific roles (planner, executor, reflector, finalizer) on top; that extra scaffolding *is* the point of the comparison.
+- **Tools.** Identical implementations and schemas in `tools/`. The Claude Agent SDK exposes them as an in-process MCP server (`mcp__hb__*`); the OpenAI Agents SDK exposes them as `@function_tool` functions; the other harnesses go through native tool-use format via `harnesses/providers/`. The underlying `tools.execute()` dispatcher is the same for all of them.
+- **Iteration budget.** Same `harnesses/common.py::MAX_ITERS` (mapped to `max_turns` in the agent SDKs).
+- **Prompt caching.** `cache_control: {"type": "ephemeral"}` is attached to the system message for thin and langgraph when `--provider anthropic` (Anthropic-only feature). The Claude Agent SDK handles caching internally. The OpenAI provider reports `cache_read` only when the official OpenAI API auto-caches inputs (most OpenAI-compatible servers omit this field). Gemini reports `cache_read` only when the input matched a manually-created context cache. `cache_write` is Anthropic-only.
+- **LLM-as-judge.** `eval/judge.py` is intentionally pinned to Anthropic / `MODEL` regardless of which harness produced the answer — a single judge keeps cross-provider rubric scoring consistent. Requires `ANTHROPIC_API_KEY` even in OpenAI-only or Gemini-only runs that include research tasks.
 
 **Known structural differences (not confounds to hide — call them out in the writeup):**
-- `temperature` / `max_tokens`: thin and langgraph are pinned to `temperature=0.0`, `max_tokens=4096`. `ClaudeAgentOptions` in `claude-agent-sdk` 0.1.63 does not expose these, so that harness uses SDK defaults.
-- Built-in tools: the Claude Agent SDK ships with its own `Bash`/`Read`/`Edit`/`WebSearch`/etc. — we deny them via `disallowed_tools` and omit them from `allowed_tools` so the agent can only call our six custom tools. This is enforced by an allowlist, not hard-disabled.
-- `setting_sources=[]` on the Claude SDK harness so user/project `CLAUDE.md` and other settings don't leak into reproducibility.
+- `temperature` / `max_tokens`: thin, langgraph, and langgraph_react are pinned to `temperature=0.0`, `max_tokens=4096`. `ClaudeAgentOptions` in `claude-agent-sdk` 0.1.63 does not expose these, so `ai_agent --provider anthropic` uses SDK defaults. Reasoning models on the OpenAI side (gpt-5 / o1 / o3 / o4) reject `temperature` entirely and use `max_completion_tokens` — handled inside `openai_common.chat_completions_kwargs`.
+- Built-in tools: the Claude Agent SDK ships with its own `Bash`/`Read`/`Edit`/`WebSearch`/etc. — we deny them via `disallowed_tools` and omit them from `allowed_tools` so the agent can only call our six custom tools. Enforced by an allowlist, not hard-disabled.
+- `setting_sources=[]` on `ai_agent --provider anthropic` so user/project `CLAUDE.md` and other settings don't leak into reproducibility.
 
 ## TODOs
 
 ### Multi-provider harnesses
 
-Extend the benchmark beyond Anthropic-only harnesses so the "thin vs. thick" question can be answered *across* the major frontier model providers, not just within one. For each vendor we'd add a "thin" (raw SDK + tool loop) and a "structured-thin" (official agent framework) harness, slotting them into the existing `(task × harness × trial)` matrix — the shared `tools/`, task suite, evaluators, and runner stay unchanged.
+Done for Anthropic and OpenAI; mostly done for Gemini. The matrix is now `(harness × task × trial × provider)` where `harness ∈ {thin, ai_agent, langgraph_react, langgraph}` (4) and `provider ∈ {anthropic, openai, gemini}` (3 with caveats — see below). Adding a new provider is one new file in `harnesses/providers/` plus a branch in `harnesses/providers/__init__.py::get_provider()`.
 
 - [x] **Google: `google-genai` thin harness** — folded into the unified `harnesses/thin.py` via `harnesses/providers/gemini.py`. Run with `--harnesses thin --provider gemini`. Uses `google.genai.Client().models.generate_content(...)` with auto function-calling disabled so the harness loop matches the other providers exactly. Requires `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) in `.env`. Model selection via `GEMINI_MODEL` env var (default `gemini-2.5-pro`).
 - [ ] **Google: Gemini ADK harness** — `harnesses/gemini_adk.py` (or similar), then add a `gemini` branch to `harnesses/ai_agent.py::run()` and `--harnesses ai_agent --provider gemini` Just Works. Uses Google's [Agent Development Kit](https://google.github.io/adk-docs/) (`google-adk` package). Register our tools as ADK `Tool`s, run via the ADK's session/runner API, drain events equivalent to our current `AssistantMessage`/`ToolUseBlock`/`ResultMessage` parsing. LangSmith has a native integration (`langsmith[google-adk]`), use that for observability.
@@ -210,7 +216,7 @@ Extend the benchmark beyond Anthropic-only harnesses so the "thin vs. thick" que
 - [x] **OpenAI: Agents SDK harness** — `harnesses/openai_agents.py`, dispatched by `harnesses/ai_agent.py` when `--provider openai`. Uses the [`openai-agents`](https://openai.github.io/openai-agents-python/) Python package with our six shared tools registered via `@function_tool`. LangSmith integration via `langsmith[openai-agents]`.
 - [x] **OpenAI: thick LangGraph harness** — folded into the unified `harnesses/langgraph_h.py` via the shared `Provider` abstraction. Run with `--harnesses langgraph --provider openai`. Same for Gemini: `--harnesses langgraph --provider gemini` Just Works (the `GeminiProvider` is reused).
 
-Adding the Google harnesses turns the benchmark into a 3-provider × {thin, structured-thin, prebuilt-react, thick-graph} grid. The interesting question shifts from "does scaffolding help within Anthropic?" to "does the *same* scaffolding pattern buy more on weaker backbones than on stronger ones, and do different providers' official agent frameworks converge on similar quality/cost tradeoffs?"
+With three providers and four harnesses already in place (modulo the two Gemini caveats), the central question shifts from "does scaffolding help within Anthropic?" to "does the *same* scaffolding pattern buy more on weaker backbones than on stronger ones, and do different providers' official agent frameworks converge on similar quality/cost tradeoffs?"
 
 ### Other follow-ons
 
