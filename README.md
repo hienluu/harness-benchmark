@@ -10,7 +10,7 @@ Each harness exists in two flavors — Anthropic-backed (Claude) and OpenAI-back
 ## Design
 
 - **Thin harness** (`harnesses/thin.py`): provider-agnostic SDK + while-loop. No framework. Provider is selected with `--provider {anthropic,openai,gemini}`; the format-specific bits live in `harnesses/providers/`. To add a new provider, drop in `harnesses/providers/<name>.py`.
-- **Structured-thin harness** (`harnesses/claude_sdk.py` / `harnesses/openai_agents.py`): the provider's official agent SDK (Claude Agent SDK or OpenAI Agents SDK) wrapping our six shared tools. Built-in SDK tools are explicitly denied where applicable.
+- **Structured-thin harness** (`harnesses/ai_agent.py`): provider-agnostic dispatcher that routes to the matching official agent SDK based on `--provider` — `claude-agent-sdk` (anthropic) or `openai-agents` (openai). The actual SDK-specific implementations live in `claude_sdk.py` and `openai_agents.py`; `ai_agent.py` just picks one. Built-in SDK tools are explicitly denied where applicable.
 - **LangGraph prebuilt harness** (`harnesses/langgraph_react.py` / `harnesses/openai_langgraph_react.py`): the prebuilt idiomatic LangGraph agent (`create_agent`) — a simple LLM → ToolNode loop. Serves as the baseline for "LangGraph as LangGraph wants to be used" so the thick harness's cost can be split into "framework tax" vs. "our custom topology tax."
 - **Thick harness** (`harnesses/langgraph_h.py` / `harnesses/openai_langgraph_h.py`): LangGraph StateGraph with planner → router → executor → reflector nodes.
 - **Shared:** model (`claude-sonnet-4-6`), system prompt, max iterations, tool implementations (`tools/`), task suite, evaluators. The only variable is harness structure. Note: the Claude Agent SDK does not expose `temperature` / `max_tokens` via its options surface, so those fall back to SDK defaults — flagged in the report as an honest structural difference.
@@ -37,7 +37,7 @@ uv run python eval/runner.py --trials 3
 uv run python eval/runner.py --trials 3 --workers 8
 
 # Subset harnesses or tasks
-uv run python eval/runner.py --harnesses thin,claude_sdk --tasks code_merge_intervals,tool_csv_mean --trials 1
+uv run python eval/runner.py --harnesses thin,ai_agent --tasks code_merge_intervals,tool_csv_mean --trials 1
 
 # Keep each trial's scratch dir around to inspect the code the agent wrote
 uv run python eval/runner.py --tasks code_lru_cache --trials 1 --keep-scratch
@@ -50,7 +50,7 @@ uv run python analyze.py
 uv run python analyze.py --open
 ```
 
-Harness ids: `thin`, `claude_sdk`, `langgraph_react`, `langgraph`, `openai_agents`, `openai_langgraph_react`, `openai_langgraph`. The `thin` harness is provider-agnostic — pair it with `--provider anthropic` (default) or `--provider openai` to target a different backend; everything else is provider-pinned by virtue of wrapping a provider-specific framework or SDK.
+Harness ids: `thin`, `ai_agent`, `langgraph_react`, `langgraph`, `openai_langgraph_react`, `openai_langgraph`. The `thin` and `ai_agent` harnesses are provider-agnostic — pair them with `--provider anthropic` (default), `--provider openai`, or `--provider gemini` (thin only, for now) to target a different backend. Everything else is provider-pinned by virtue of wrapping a provider-specific framework class.
 
 ### OpenAI / OpenAI-compatible models
 
@@ -63,7 +63,7 @@ OPENAI_BASE_URL=https://api.openai.com/v1     # default — omit for OpenAI prop
 
 # Run the four OpenAI-pinned harnesses + the thin harness pointed at OpenAI
 uv run python eval/runner.py \
-  --harnesses thin,openai_langgraph_react,openai_langgraph,openai_agents \
+  --harnesses thin,ai_agent,openai_langgraph_react,openai_langgraph \
   --provider openai \
   --openai-model gpt-5 \
   --tasks code_merge_intervals --trials 1
@@ -112,9 +112,11 @@ Results land in `results/run_<timestamp>/` with per-run `trial_N.json` (metrics)
 ## Layout
 
 ```
-harnesses/             thin.py (provider-agnostic), claude_sdk.py, langgraph_react.py,
-                       langgraph_h.py, openai_langgraph_react.py, openai_langgraph_h.py,
-                       openai_agents.py, common.py + openai_common.py (shared constants)
+harnesses/             thin.py + ai_agent.py (provider-agnostic dispatchers),
+                       claude_sdk.py + openai_agents.py (agent-SDK impls dispatched by ai_agent),
+                       langgraph_react.py, langgraph_h.py,
+                       openai_langgraph_react.py, openai_langgraph_h.py,
+                       common.py + openai_common.py (shared constants)
 harnesses/providers/   __init__.py (Provider protocol + factory), anthropic.py, openai.py, gemini.py
 tools/                 bash.py, fs.py, __init__.py (shared schemas + dispatcher)
 tasks/                 10 Task modules under code/, tool_chain/, research/
@@ -180,8 +182,8 @@ When `LANGSMITH_TRACING` is unset (or falsy), tracing is a complete no-op — no
 - `thin` (`--provider openai`) + `openai_langgraph` — OpenAI client wrapped via `langsmith.wrappers.wrap_openai`; same per-call trace shape as the Anthropic side.
 - `thin` (`--provider gemini`) — google-genai client wrapped via `langsmith.wrappers.wrap_gemini` (beta in LangSmith ≥ 0.4.33); patches `models.generate_content` so each tool-loop step shows up as a traced span with token usage and tool calls.
 - `langgraph_react` + `openai_langgraph_react` — LangChain / LangGraph emit LangSmith spans natively when `LANGSMITH_TRACING=true`; every agent and tool node step is traced without any extra wiring, regardless of which `ChatX` provider class backs the model.
-- `claude_sdk` — uses LangSmith's first-class `configure_claude_agent_sdk()` integration (from the `langsmith[claude-agent-sdk]` extra), called once at runner startup. Traces agent queries, tool invocations, model calls, and MCP server operations natively — no hand-rolled spans. **Caveat:** subagent tool calls aren't captured today (see [langchain-ai/langsmith-sdk#2091](https://github.com/langchain-ai/langsmith-sdk/issues/2091)); the `claude_sdk` harness here doesn't use subagents, so that limitation doesn't apply.
-- `openai_agents` — uses LangSmith's first-class `configure_openai_agents()` integration (from the `langsmith[openai-agents]` extra), called once at runner startup. Parallel to the Claude SDK integration above.
+- `ai_agent` (`--provider anthropic`) — dispatches to the Claude Agent SDK; LangSmith's first-class `configure_claude_agent_sdk()` integration (from the `langsmith[claude-agent-sdk]` extra) is installed at runner startup when this combination is selected. Traces agent queries, tool invocations, model calls, and MCP server operations natively. **Caveat:** subagent tool calls aren't captured today (see [langchain-ai/langsmith-sdk#2091](https://github.com/langchain-ai/langsmith-sdk/issues/2091)); the harness here doesn't use subagents, so that limitation doesn't apply.
+- `ai_agent` (`--provider openai`) — dispatches to the OpenAI Agents SDK; the `OpenAIAgentsTracingProcessor` (from the `langsmith[openai-agents]` extra) is installed at runner startup when this combination is selected. Parallel to the Claude SDK integration above.
 
 ## Fairness audit
 
@@ -205,9 +207,9 @@ All harnesses share:
 Extend the benchmark beyond Anthropic-only harnesses so the "thin vs. thick" question can be answered *across* the major frontier model providers, not just within one. For each vendor we'd add a "thin" (raw SDK + tool loop) and a "structured-thin" (official agent framework) harness, slotting them into the existing `(task × harness × trial)` matrix — the shared `tools/`, task suite, evaluators, and runner stay unchanged.
 
 - [x] **Google: `google-genai` thin harness** — folded into the unified `harnesses/thin.py` via `harnesses/providers/gemini.py`. Run with `--harnesses thin --provider gemini`. Uses `google.genai.Client().models.generate_content(...)` with auto function-calling disabled so the harness loop matches the other providers exactly. Requires `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) in `.env`. Model selection via `GEMINI_MODEL` env var (default `gemini-2.5-pro`).
-- [ ] **Google: Gemini ADK harness** — `harnesses/gemini_adk.py`. Uses Google's [Agent Development Kit](https://google.github.io/adk-docs/) (`google-adk` package) — the "structured-thin" analogue to Claude Agent SDK. Register our tools as ADK `Tool`s, run via the ADK's session/runner API, drain events equivalent to our current `AssistantMessage`/`ToolUseBlock`/`ResultMessage` parsing. LangSmith has a native integration (`langsmith[google-adk]`), use that for observability.
+- [ ] **Google: Gemini ADK harness** — `harnesses/gemini_adk.py` (or similar), then add a `gemini` branch to `harnesses/ai_agent.py::run()` and `--harnesses ai_agent --provider gemini` Just Works. Uses Google's [Agent Development Kit](https://google.github.io/adk-docs/) (`google-adk` package). Register our tools as ADK `Tool`s, run via the ADK's session/runner API, drain events equivalent to our current `AssistantMessage`/`ToolUseBlock`/`ResultMessage` parsing. LangSmith has a native integration (`langsmith[google-adk]`), use that for observability.
 - [x] **OpenAI: `openai` client thin harness** — folded into the unified `harnesses/thin.py` via `harnesses/providers/openai.py`. Run with `--harnesses thin --provider openai`. Implemented against Chat Completions (not Responses API) so it also works against any OpenAI-compatible server (vLLM, Ollama, OpenRouter, Together, …). Model selection via `--openai-model`; key + endpoint via `.env`.
-- [x] **OpenAI: Agents SDK harness** — `harnesses/openai_agents.py`. Uses the [`openai-agents`](https://openai.github.io/openai-agents-python/) Python package with our six shared tools registered via `@function_tool`. LangSmith integration via `langsmith[openai-agents]`.
+- [x] **OpenAI: Agents SDK harness** — `harnesses/openai_agents.py`, dispatched by `harnesses/ai_agent.py` when `--provider openai`. Uses the [`openai-agents`](https://openai.github.io/openai-agents-python/) Python package with our six shared tools registered via `@function_tool`. LangSmith integration via `langsmith[openai-agents]`.
 - [x] **OpenAI: thick LangGraph + prebuilt-react flavors** — `harnesses/openai_langgraph_h.py` and `harnesses/openai_langgraph_react.py`. The thick topology and the prebuilt `create_agent` baseline, both backed by `ChatOpenAI` / direct OpenAI client.
 
 Adding the Google harnesses turns the benchmark into a 3-provider × {thin, structured-thin, prebuilt-react, thick-graph} grid. The interesting question shifts from "does scaffolding help within Anthropic?" to "does the *same* scaffolding pattern buy more on weaker backbones than on stronger ones, and do different providers' official agent frameworks converge on similar quality/cost tradeoffs?"

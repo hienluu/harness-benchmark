@@ -32,15 +32,14 @@ except ImportError:
 from functools import partial
 
 from harnesses import (
-    claude_sdk,
+    ai_agent,
     langgraph_h,
     langgraph_react,
-    openai_agents,
     openai_langgraph_h,
     openai_langgraph_react,
     thin,
 )
-from harnesses.common import usd_cost
+from harnesses.common import MODEL as ANTHROPIC_MODEL, usd_cost
 from harnesses.openai_common import DEFAULT_OPENAI_MODEL
 from harnesses.providers import SUPPORTED_PROVIDERS, get_provider
 from harnesses.providers.gemini import DEFAULT_GEMINI_MODEL
@@ -54,35 +53,36 @@ from eval.tracing import (
 )
 
 
-# `thin` is provider-agnostic — its provider is supplied by --provider at run
+# `thin` and `ai_agent` are provider-agnostic — both honor --provider at run
 # time (default: anthropic). The other harnesses are provider-pinned because
-# they wrap a provider-specific framework / SDK.
+# they wrap a provider-specific framework (LangChain ChatX classes).
 HARNESSES = {
     "thin": thin.run,
+    "ai_agent": ai_agent.run,
     "langgraph": langgraph_h.run,
     "langgraph_react": langgraph_react.run,
-    "claude_sdk": claude_sdk.run,
     "openai_langgraph": openai_langgraph_h.run,
     "openai_langgraph_react": openai_langgraph_react.run,
-    "openai_agents": openai_agents.run,
 }
 
-ANTHROPIC_HARNESSES = {"langgraph", "langgraph_react", "claude_sdk"}
+# Harnesses whose provider is determined by --provider rather than the harness id.
+PROVIDER_AGNOSTIC = {"thin", "ai_agent"}
+
+ANTHROPIC_HARNESSES = {"langgraph", "langgraph_react"}
 OPENAI_HARNESSES = {
     "openai_langgraph",
     "openai_langgraph_react",
-    "openai_agents",
 }
 
 
-def _provider_for(harness_name: str, thin_provider: str) -> str:
+def _provider_for(harness_name: str, provider: str) -> str:
     """Which provider should be used for cost lookup, API-key gating, etc.
 
-    `thin` is provider-agnostic and follows --provider; everything else is
-    pinned to its module's provider.
+    Provider-agnostic harnesses follow --provider; everything else is pinned
+    to its module's provider by virtue of wrapping a provider-specific framework.
     """
-    if harness_name == "thin":
-        return thin_provider
+    if harness_name in PROVIDER_AGNOSTIC:
+        return provider
     return "openai" if harness_name in OPENAI_HARNESSES else "anthropic"
 
 
@@ -132,22 +132,22 @@ def run_one(
     trial_idx: int,
     out_dir: Path,
     keep_scratch: bool = False,
-    thin_provider: str = "anthropic",
+    provider: str = "anthropic",
 ) -> dict:
     scratch = materialize(task)
     start = time.time()
-    # `thin` is the only harness that takes a provider arg; everything else
-    # is a fixed-signature run(task, scratch_dir).
+    # Provider-agnostic harnesses take a provider arg; everything else has a
+    # fixed (task, scratch_dir) signature.
     fn = HARNESSES[harness_name]
-    if harness_name == "thin":
-        fn = partial(fn, provider=thin_provider)
+    if harness_name in PROVIDER_AGNOSTIC:
+        fn = partial(fn, provider=provider)
     try:
         with run_context(
             harness=harness_name,
             task_id=task.id,
             trial=trial_idx,
             category=task.category,
-            provider=_provider_for(harness_name, thin_provider),
+            provider=_provider_for(harness_name, provider),
         ):
             traj = fn(task, scratch)
         crashed = False
@@ -190,7 +190,7 @@ def run_one(
         "task_id": task.id,
         "category": task.category,
         "harness": harness_name,
-        "provider": _provider_for(harness_name, thin_provider),
+        "provider": _provider_for(harness_name, provider),
         "trial": trial_idx,
         "passed": passed,
         "score_normalized": final_score,
@@ -211,7 +211,7 @@ def run_one(
             traj.tokens_out,
             traj.cache_read,
             traj.cache_write,
-            provider=_provider_for(harness_name, thin_provider),
+            provider=_provider_for(harness_name, provider),
         ),
         "stopped_reason": traj.stopped_reason,
         "failure_mode": failure_mode,
@@ -257,7 +257,7 @@ def run_one(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--harnesses", default="thin,langgraph,langgraph_react,claude_sdk")
+    ap.add_argument("--harnesses", default="thin,langgraph,langgraph_react,ai_agent")
     ap.add_argument("--tasks", default="all", help="'all' or comma-separated task ids")
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument(
@@ -265,11 +265,11 @@ def main():
         default="anthropic",
         choices=list(SUPPORTED_PROVIDERS),
         help=(
-            "Which LLM provider the `thin` harness uses (default: anthropic). "
-            "Other harnesses are provider-pinned and ignore this flag — "
-            "openai_* harnesses always use OpenAI, claude_sdk always uses "
-            "Anthropic, etc. Use --provider openai with --harnesses thin to "
-            "run the thin pattern against OpenAI / OpenAI-compatible endpoints."
+            "Which LLM provider the `thin` and `ai_agent` harnesses use "
+            "(default: anthropic). `ai_agent` dispatches to the matching "
+            "agent SDK: claude-agent-sdk for anthropic, openai-agents for "
+            "openai (gemini not yet implemented for ai_agent). Other "
+            "harnesses are provider-pinned and ignore this flag."
         ),
     )
     ap.add_argument(
@@ -327,13 +327,26 @@ def main():
     needs_anthropic = any(h in ANTHROPIC_HARNESSES for h in harnesses)
     needs_openai = any(h in OPENAI_HARNESSES for h in harnesses)
     needs_gemini = False
-    # `thin` follows --provider, so its provider also drives key gating.
-    if "thin" in harnesses:
-        # Validate the provider is actually implemented before starting any work.
-        try:
-            get_provider(args.provider)
-        except (NotImplementedError, ValueError) as e:
-            sys.exit(f"ERROR: --provider {args.provider!r}: {e}")
+    # Provider-agnostic harnesses (thin, ai_agent) follow --provider; their
+    # provider also drives key gating and tracing setup.
+    uses_provider_agnostic = any(h in PROVIDER_AGNOSTIC for h in harnesses)
+    if uses_provider_agnostic:
+        # Validate the provider is implemented for thin (the broader Provider
+        # protocol). ai_agent is gated separately below since the agent SDKs
+        # are independently optional.
+        if "thin" in harnesses:
+            try:
+                get_provider(args.provider)
+            except (NotImplementedError, ValueError) as e:
+                sys.exit(f"ERROR: --provider {args.provider!r}: {e}")
+        # ai_agent doesn't yet have a Gemini implementation (no Google ADK
+        # harness). Fail fast with a clear message instead of crashing mid-run.
+        if "ai_agent" in harnesses and args.provider == "gemini":
+            sys.exit(
+                "ERROR: ai_agent --provider gemini is not yet implemented "
+                "(no Google ADK harness). Use `thin --provider gemini` for the "
+                "Gemini thin harness, or pick a different --provider for ai_agent."
+            )
         if args.provider == "anthropic":
             needs_anthropic = True
         elif args.provider == "openai":
@@ -397,10 +410,14 @@ def main():
     if tracing_enabled():
         project = os.environ.get("LANGSMITH_PROJECT", "(default)")
         print(f"langsmith tracing: ON (project={project})")
-        if "claude_sdk" in harnesses and not configure_claude_sdk_tracing():
-            print("WARNING: failed to configure Claude SDK tracing")
-        if "openai_agents" in harnesses and not configure_openai_agents_tracing():
-            print("WARNING: failed to configure OpenAI Agents SDK tracing")
+        # ai_agent dispatches to either claude-agent-sdk (anthropic) or
+        # openai-agents (openai); install only the matching trace processor.
+        if "ai_agent" in harnesses and args.provider == "anthropic":
+            if not configure_claude_sdk_tracing():
+                print("WARNING: failed to configure Claude SDK tracing")
+        if "ai_agent" in harnesses and args.provider == "openai":
+            if not configure_openai_agents_tracing():
+                print("WARNING: failed to configure OpenAI Agents SDK tracing")
     else:
         print("langsmith tracing: OFF")
 
@@ -412,7 +429,8 @@ def main():
         "tasks": [t.id for t in all_tasks],
         "trials": args.trials,
         "workers": args.workers,
-        "thin_provider": args.provider if "thin" in harnesses else None,
+        "provider": args.provider if uses_provider_agnostic else None,
+        "anthropic_model": ANTHROPIC_MODEL if needs_anthropic else None,
         "openai_model": os.environ.get("OPENAI_MODEL") if needs_openai else None,
         "openai_base_url": os.environ.get("OPENAI_BASE_URL") if needs_openai else None,
         "gemini_model": os.environ.get("GEMINI_MODEL") if needs_gemini else None,
@@ -454,7 +472,7 @@ def main():
             rec = run_one(
                 task, h, trial, out_dir,
                 keep_scratch=args.keep_scratch,
-                thin_provider=args.provider,
+                provider=args.provider,
             )
             summary.append(rec)
             print(_format_line(rec, i))

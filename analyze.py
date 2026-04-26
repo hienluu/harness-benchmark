@@ -93,11 +93,14 @@ def report(run_dir: Path) -> str:
     if len(known_providers) == 1:
         line = f"- **Provider:** {known_providers[0]}"
         # Surface the model name when we can — comes from the run's manifest
-        # (set by the runner when --provider is the matching one).
-        if known_providers[0] == "openai" and manifest.get("openai_model"):
-            line += f" ({manifest['openai_model']})"
-        elif known_providers[0] == "gemini" and manifest.get("gemini_model"):
-            line += f" ({manifest['gemini_model']})"
+        # (set by the runner for whichever providers were in use).
+        model_field = {
+            "anthropic": "anthropic_model",
+            "openai": "openai_model",
+            "gemini": "gemini_model",
+        }.get(known_providers[0])
+        if model_field and manifest.get(model_field):
+            line += f" ({manifest[model_field]})"
         out.append(line)
     elif known_providers:
         # Mixed providers — group harnesses by provider so it's easy to see
