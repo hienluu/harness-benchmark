@@ -57,13 +57,18 @@ class OpenAIProvider:
     ) -> ModelStep:
         # `system` is unused here — already injected via initial_messages and
         # carried in the messages list across turns.
-        resp = client.chat.completions.create(
+        kwargs: dict = {
             **chat_completions_kwargs(
                 model, max_tokens=max_tokens, temperature=temperature
             ),
-            messages=messages,
-            tools=tools,
-        )
+            "messages": messages,
+        }
+        # Skip `tools` when empty so nodes that don't need tools (e.g.
+        # langgraph_h's planner / reflector / finalizer) don't declare a
+        # zero-length tools array.
+        if tools:
+            kwargs["tools"] = tools
+        resp = client.chat.completions.create(**kwargs)
         usage = extract_usage(resp)
         msg = resp.choices[0].message
         raw_calls = msg.tool_calls or []

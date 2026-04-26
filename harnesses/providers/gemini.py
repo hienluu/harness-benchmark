@@ -101,16 +101,23 @@ class GeminiProvider:
         max_tokens: int,
         temperature: float,
     ) -> ModelStep:
-        config = types.GenerateContentConfig(
-            system_instruction=system,
-            tools=tools,
-            temperature=temperature,
-            max_output_tokens=max_tokens,
+        config_kwargs: dict = {
+            "system_instruction": system,
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
             # We run our own tool loop — disable the SDK's auto function calling
             # so we get raw FunctionCall parts back instead of the SDK silently
             # invoking Python callables.
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        )
+            "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
+        }
+        # Skip `tools` when empty so nodes that don't need tools (e.g.
+        # langgraph_h's planner / reflector / finalizer) don't pass a
+        # zero-length tools array.
+        if tools:
+            config_kwargs["tools"] = tools
+        config = types.GenerateContentConfig(**config_kwargs)
         resp = client.models.generate_content(
             model=model,
             contents=messages,

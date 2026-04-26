@@ -1,10 +1,18 @@
-"""Thick harness: LangGraph StateGraph with planner / router / executor / reflector.
+"""Thick LangGraph harness, provider-agnostic.
 
 Deliberately structured. Each task goes through:
-  planner -> router -> executor -> reflector -> router -> ... -> END
+  planner -> router -> executor -> reflector -> router -> ... -> finalizer -> END
 
-Nodes call the Anthropic API directly (same client, same model, same prompt
-shell as the thin harness) so the only difference is orchestration.
+Every node calls the LLM via the same `Provider` abstraction `thin.py` uses
+(`harnesses/providers/`), so the only thing that changes between providers
+is which SDK call gets made under the hood. The graph topology, node
+budgets, prompts, and accounting are identical regardless of provider —
+which is the whole point of being able to compare thick-vs-thin on either
+backbone independently.
+
+Run with `--provider {anthropic,openai,gemini}` (gemini works too, since
+the GeminiProvider already exists and the planner/reflector/finalizer
+nodes don't need tools).
 """
 
 from __future__ import annotations
@@ -14,17 +22,15 @@ import time
 from pathlib import Path
 from typing import Optional, TypedDict
 
-import anthropic
 from langgraph.graph import END, StateGraph
 
-from eval.tracing import wrap_anthropic_client
 from harnesses.common import (
     MAX_ITERS,
     MAX_TOKENS_PER_CALL,
-    MODEL,
     SYSTEM_PROMPT,
     TEMPERATURE,
 )
+from harnesses.providers import ModelStep, Provider, get_provider
 from tasks.registry import Task, Trajectory
 from tools import TOOL_SCHEMAS, execute
 
@@ -36,9 +42,9 @@ MAX_SUBGOALS = 6
 class GState(TypedDict, total=False):
     task_prompt: str
     scratch_dir: str
+    provider: str
     plan: list[str]
     current_idx: int
-    executor_msgs: list[dict]
     final_answer: Optional[str]
     done: bool
     # accounting
@@ -51,51 +57,50 @@ class GState(TypedDict, total=False):
     messages_log: list[dict]
 
 
-def _client() -> anthropic.Anthropic:
-    return wrap_anthropic_client(anthropic.Anthropic())
+def _system(extra: str = "") -> str:
+    return SYSTEM_PROMPT + ("\n\n" + extra if extra else "")
 
 
-def _system_blocks(extra: str = "") -> list[dict]:
-    text = SYSTEM_PROMPT + ("\n\n" + extra if extra else "")
-    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+def _provider_obj(state: GState) -> Provider:
+    return get_provider(state["provider"])
 
 
-def _bump(state: GState, usage) -> None:
+def _bump(state: GState, step: ModelStep) -> None:
     state["turns"] = state.get("turns", 0) + 1
-    state["tokens_in"] = state.get("tokens_in", 0) + usage.input_tokens
-    state["tokens_out"] = state.get("tokens_out", 0) + usage.output_tokens
-    state["cache_read"] = state.get("cache_read", 0) + (
-        getattr(usage, "cache_read_input_tokens", 0) or 0
-    )
-    state["cache_write"] = state.get("cache_write", 0) + (
-        getattr(usage, "cache_creation_input_tokens", 0) or 0
-    )
+    ti, to, cr, cw = step.usage
+    state["tokens_in"] = state.get("tokens_in", 0) + ti
+    state["tokens_out"] = state.get("tokens_out", 0) + to
+    state["cache_read"] = state.get("cache_read", 0) + cr
+    state["cache_write"] = state.get("cache_write", 0) + cw
 
 
 def planner_node(state: GState) -> GState:
-    prompt = (
+    p = _provider_obj(state)
+    sys_text = _system("You are the PLANNER. Decompose tasks into subgoals.")
+    user_msg = (
         "Break the following task into a short ordered list of 2 to "
         f"{MAX_SUBGOALS} concrete subgoals that can be executed with the "
         "available tools. Respond with ONLY a JSON array of strings, nothing else.\n\n"
         f"TASK:\n{state['task_prompt']}"
     )
-    resp = _client().messages.create(
-        model=MODEL,
+    step = p.call(
+        p.make_client(),
+        model=p.get_model(),
+        system=sys_text,
+        messages=p.initial_messages(sys_text, user_msg),
+        tools=[],
         max_tokens=MAX_TOKENS_PER_CALL,
         temperature=TEMPERATURE,
-        system=_system_blocks("You are the PLANNER. Decompose tasks into subgoals."),
-        messages=[{"role": "user", "content": prompt}],
     )
-    _bump(state, resp.usage)
+    _bump(state, step)
 
-    text = "".join(b.text for b in resp.content if b.type == "text").strip()
-    plan = _parse_plan(text)
+    plan = _parse_plan(step.text.strip())
     state["plan"] = plan
     state["current_idx"] = 0
     state["done"] = False
     state.setdefault("tool_calls", [])
     state.setdefault("messages_log", []).append(
-        {"node": "planner", "plan": plan, "raw": text}
+        {"node": "planner", "plan": plan, "raw": step.text}
     )
     return state
 
@@ -129,11 +134,16 @@ def _route(state: GState) -> str:
 
 def executor_node(state: GState) -> GState:
     """Run a bounded inner tool-loop to accomplish the current subgoal."""
+    p = _provider_obj(state)
+    client = p.make_client()
     scratch = Path(state["scratch_dir"])
     plan = state.get("plan", [])
     idx = state.get("current_idx", 0)
     subgoal = plan[idx] if idx < len(plan) else "Complete the task."
 
+    sys_text = _system(
+        "You are the EXECUTOR. Complete the CURRENT SUBGOAL using tools."
+    )
     user_msg = (
         f"OVERALL TASK:\n{state['task_prompt']}\n\n"
         f"PLAN:\n"
@@ -142,53 +152,52 @@ def executor_node(state: GState) -> GState:
         "Execute this subgoal with tools. When the subgoal is done, stop "
         "calling tools. Only call `finish` if the entire task is complete."
     )
-    messages: list[dict] = [{"role": "user", "content": user_msg}]
-    client = _client()
+    messages = p.initial_messages(sys_text, user_msg)
+    tools = p.encode_tools(TOOL_SCHEMAS)
+    model = p.get_model()
 
     for _ in range(EXECUTOR_STEP_BUDGET):
         if state.get("turns", 0) >= MAX_ITERS:
             break
-        resp = client.messages.create(
-            model=MODEL,
+        step = p.call(
+            client,
+            model=model,
+            system=sys_text,
+            messages=messages,
+            tools=tools,
             max_tokens=MAX_TOKENS_PER_CALL,
             temperature=TEMPERATURE,
-            system=_system_blocks(
-                "You are the EXECUTOR. Complete the CURRENT SUBGOAL using tools."
-            ),
-            tools=TOOL_SCHEMAS,
-            messages=messages,
         )
-        _bump(state, resp.usage)
+        _bump(state, step)
 
-        assistant_content = [b.model_dump() for b in resp.content]
-        messages.append({"role": "assistant", "content": assistant_content})
-        state["messages_log"].append({"node": "executor", "content": assistant_content})
+        messages.append(step.assistant_message)
+        state["messages_log"].append(
+            {"node": "executor", "content": step.assistant_message}
+        )
 
-        tool_uses = [b for b in resp.content if b.type == "tool_use"]
-        finish_call = next((b for b in tool_uses if b.name == "finish"), None)
+        finish_call = next(
+            (tc for tc in step.tool_calls if tc.name == "finish"), None
+        )
         if finish_call:
-            state["final_answer"] = finish_call.input.get("answer", "")
+            state["final_answer"] = finish_call.args.get("answer", "")
             state["done"] = True
             state["tool_calls"].append(
-                {"name": "finish", "input": finish_call.input, "result": "FINISHED"}
+                {"name": "finish", "input": finish_call.args, "result": "FINISHED"}
             )
             return state
-        if not tool_uses:
+        if not step.tool_calls:
             break
 
-        tool_results = []
-        for tu in tool_uses:
-            result = execute(tu.name, tu.input, scratch)
-            tool_results.append(
-                {"type": "tool_result", "tool_use_id": tu.id, "content": result}
-            )
+        results: list = []
+        for tc in step.tool_calls:
+            result = execute(tc.name, tc.args, scratch)
+            results.append((tc, result))
             state["tool_calls"].append(
-                {"name": tu.name, "input": tu.input, "result": result}
+                {"name": tc.name, "input": tc.args, "result": result}
             )
-        messages.append({"role": "user", "content": tool_results})
-        state["messages_log"].append(
-            {"node": "executor", "content": tool_results}
-        )
+        result_msgs = p.encode_tool_results(results)
+        messages.extend(result_msgs)
+        state["messages_log"].append({"node": "executor", "content": result_msgs})
     return state
 
 
@@ -196,10 +205,12 @@ def reflector_node(state: GState) -> GState:
     """Ask the model if progress is acceptable and possibly revise the plan."""
     if state.get("done"):
         return state
+    p = _provider_obj(state)
     plan = state.get("plan", [])
     idx = state.get("current_idx", 0)
     recent_calls = state["tool_calls"][-6:]
-    prompt = (
+    sys_text = _system("You are the REFLECTOR. Decide if the plan needs revision.")
+    user_msg = (
         f"PLAN: {plan}\n"
         f"JUST FINISHED SUBGOAL INDEX: {idx}\n"
         f"RECENT TOOL CALLS: {json.dumps(recent_calls, default=str)[:2000]}\n\n"
@@ -208,21 +219,20 @@ def reflector_node(state: GState) -> GState:
         "Use \"done\" only if the entire task is complete, \"revise\" if the plan is wrong, "
         "\"ok\" otherwise."
     )
-    resp = _client().messages.create(
-        model=MODEL,
+    step = p.call(
+        p.make_client(),
+        model=p.get_model(),
+        system=sys_text,
+        messages=p.initial_messages(sys_text, user_msg),
+        tools=[],
         max_tokens=1024,
         temperature=TEMPERATURE,
-        system=_system_blocks(
-            "You are the REFLECTOR. Decide if the plan needs revision."
-        ),
-        messages=[{"role": "user", "content": prompt}],
     )
-    _bump(state, resp.usage)
+    _bump(state, step)
 
-    text = "".join(b.text for b in resp.content if b.type == "text").strip()
-    decision = _parse_reflection(text)
+    decision = _parse_reflection(step.text.strip())
     state["messages_log"].append(
-        {"node": "reflector", "decision": decision, "raw": text}
+        {"node": "reflector", "decision": decision, "raw": step.text}
     )
     if decision.get("progress") == "done":
         state["done"] = True
@@ -251,25 +261,28 @@ def finalizer_node(state: GState) -> GState:
     """If we exited without the executor calling `finish`, synthesize a final answer."""
     if state.get("final_answer") is not None:
         return state
+    p = _provider_obj(state)
     recent = state["tool_calls"][-8:]
-    prompt = (
+    sys_text = _system("You are the FINALIZER. Produce the final answer.")
+    user_msg = (
         f"TASK:\n{state['task_prompt']}\n\n"
         f"PLAN WAS: {state.get('plan')}\n"
         f"RECENT TOOL CALLS: {json.dumps(recent, default=str)[:2000]}\n\n"
         "Write the final answer to the task in plain text."
     )
-    resp = _client().messages.create(
-        model=MODEL,
+    step = p.call(
+        p.make_client(),
+        model=p.get_model(),
+        system=sys_text,
+        messages=p.initial_messages(sys_text, user_msg),
+        tools=[],
         max_tokens=MAX_TOKENS_PER_CALL,
         temperature=TEMPERATURE,
-        system=_system_blocks("You are the FINALIZER. Produce the final answer."),
-        messages=[{"role": "user", "content": prompt}],
     )
-    _bump(state, resp.usage)
-    text = "".join(b.text for b in resp.content if b.type == "text").strip()
-    state["final_answer"] = text
+    _bump(state, step)
+    state["final_answer"] = step.text.strip()
     state["done"] = True
-    state["messages_log"].append({"node": "finalizer", "answer": text})
+    state["messages_log"].append({"node": "finalizer", "answer": step.text})
     return state
 
 
@@ -295,7 +308,7 @@ def _build_graph():
 _GRAPH = None
 
 
-def run(task: Task, scratch_dir: Path) -> Trajectory:
+def run(task: Task, scratch_dir: Path, provider: str = "anthropic") -> Trajectory:
     global _GRAPH
     if _GRAPH is None:
         _GRAPH = _build_graph()
@@ -303,6 +316,7 @@ def run(task: Task, scratch_dir: Path) -> Trajectory:
     initial: GState = {
         "task_prompt": task.prompt,
         "scratch_dir": str(scratch_dir),
+        "provider": provider,
         "plan": [],
         "current_idx": 0,
         "done": False,

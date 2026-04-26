@@ -35,8 +35,6 @@ from harnesses import (
     ai_agent,
     langgraph_h,
     langgraph_react,
-    openai_langgraph_h,
-    openai_langgraph_react,
     thin,
 )
 from harnesses.common import MODEL as ANTHROPIC_MODEL, usd_cost
@@ -53,26 +51,26 @@ from eval.tracing import (
 )
 
 
-# `thin` and `ai_agent` are provider-agnostic — both honor --provider at run
-# time (default: anthropic). The other harnesses are provider-pinned because
-# they wrap a provider-specific framework (LangChain ChatX classes).
+# Every harness is provider-agnostic now — they all honor --provider at run
+# time (default: anthropic). The provider-specific bits live in
+# harnesses/providers/ (used directly by thin and langgraph) or are dispatched
+# inside the harness file (ai_agent picks an Agent SDK; langgraph_react picks
+# a LangChain ChatX class).
 HARNESSES = {
     "thin": thin.run,
     "ai_agent": ai_agent.run,
     "langgraph": langgraph_h.run,
     "langgraph_react": langgraph_react.run,
-    "openai_langgraph": openai_langgraph_h.run,
-    "openai_langgraph_react": openai_langgraph_react.run,
 }
 
 # Harnesses whose provider is determined by --provider rather than the harness id.
-PROVIDER_AGNOSTIC = {"thin", "ai_agent"}
+PROVIDER_AGNOSTIC = {"thin", "ai_agent", "langgraph", "langgraph_react"}
 
-ANTHROPIC_HARNESSES = {"langgraph", "langgraph_react"}
-OPENAI_HARNESSES = {
-    "openai_langgraph",
-    "openai_langgraph_react",
-}
+# Every remaining harness is provider-agnostic now — no provider-pinned
+# variants left to track. These sets stay defined so cost/key gating below
+# treats them uniformly.
+ANTHROPIC_HARNESSES: set[str] = set()
+OPENAI_HARNESSES: set[str] = set()
 
 
 def _provider_for(harness_name: str, provider: str) -> str:
@@ -265,11 +263,12 @@ def main():
         default="anthropic",
         choices=list(SUPPORTED_PROVIDERS),
         help=(
-            "Which LLM provider the `thin` and `ai_agent` harnesses use "
-            "(default: anthropic). `ai_agent` dispatches to the matching "
-            "agent SDK: claude-agent-sdk for anthropic, openai-agents for "
-            "openai (gemini not yet implemented for ai_agent). Other "
-            "harnesses are provider-pinned and ignore this flag."
+            "Which LLM provider all harnesses use (default: anthropic). All "
+            "harnesses are provider-agnostic and honor this flag. Caveats: "
+            "`ai_agent --provider gemini` is not yet implemented (no Google "
+            "ADK harness); `langgraph_react --provider gemini` requires "
+            "langchain-google-genai. `thin` and `langgraph` support all "
+            "three providers via the harnesses/providers/ abstraction."
         ),
     )
     ap.add_argument(
@@ -346,6 +345,13 @@ def main():
                 "ERROR: ai_agent --provider gemini is not yet implemented "
                 "(no Google ADK harness). Use `thin --provider gemini` for the "
                 "Gemini thin harness, or pick a different --provider for ai_agent."
+            )
+        if "langgraph_react" in harnesses and args.provider == "gemini":
+            sys.exit(
+                "ERROR: langgraph_react --provider gemini is not yet implemented "
+                "(needs `langchain-google-genai`). Use `thin --provider gemini` "
+                "for the Gemini thin harness, or pick a different --provider for "
+                "langgraph_react."
             )
         if args.provider == "anthropic":
             needs_anthropic = True

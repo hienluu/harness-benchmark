@@ -54,15 +54,20 @@ class AnthropicProvider:
                 "cache_control": {"type": "ephemeral"},
             }
         ]
-        resp = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            cache_control={"type": "ephemeral"},
-            temperature=temperature,
-            system=system_blocks,
-            tools=tools,
-            messages=messages,
-        )
+        kwargs: dict = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "cache_control": {"type": "ephemeral"},
+            "temperature": temperature,
+            "system": system_blocks,
+            "messages": messages,
+        }
+        # Omit `tools` when empty — Anthropic accepts the kwarg but it's
+        # cleaner not to declare zero tools (and lets nodes that don't need
+        # tools, e.g. langgraph_h's planner/reflector, pass tools=[]).
+        if tools:
+            kwargs["tools"] = tools
+        resp = client.messages.create(**kwargs)
         u = resp.usage
         usage = (
             u.input_tokens,

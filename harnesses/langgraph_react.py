@@ -1,17 +1,23 @@
-"""Baseline LangGraph/LangChain harness: the prebuilt `create_agent`.
+"""LangGraph prebuilt `create_agent` harness, provider-agnostic.
 
-This is "LangChain/LangGraph as they want to be used" — the canonical prebuilt
-agent from `langchain.agents.create_agent` (successor to the deprecated
-`langgraph.prebuilt.create_react_agent`). It's a simple tool-use loop: LLM
-node decides → ToolNode executes → LLM node decides → ... → stop when the
-LLM stops calling tools.
+The simple LLM → ToolNode loop using LangGraph's idiomatic agent factory.
+Provider is selected by `--provider` (anthropic / openai); `gemini` will
+work once `langchain-google-genai` is added — it's intentionally an
+explicit not-yet so the gap is loud, not silent.
 
-Point of this harness in the benchmark: it isolates *our topology's* overhead
-(planner / router / executor / reflector / finalizer in `langgraph_h.py`)
-from *LangGraph's own* overhead. If this harness matches `thin` on cost and
-quality, the cost of `langgraph_h` is attributable to our graph design, not
-to LangGraph the framework. If this harness also costs substantially more
-than `thin`, there's a real framework tax.
+LangChain abstracts message format, tool schemas, and the agent loop; the
+only per-provider concerns are:
+  - which `ChatX` provider class to instantiate
+  - the OpenAI reasoning-model param gate (gpt-5/o1/o3/o4 reject
+    `temperature` and use `max_completion_tokens`)
+  - whether to attach an Anthropic prompt-cache marker on the system
+    message (Anthropic-only optimization)
+
+Point of this harness in the benchmark: it isolates *our topology's*
+overhead (planner / router / executor / reflector / finalizer in
+`langgraph_h.py`) from *LangGraph's own* overhead. If this harness
+matches `thin` on cost and quality, the cost of `langgraph_h` is
+attributable to our graph design, not to LangGraph the framework.
 """
 
 from __future__ import annotations
@@ -22,7 +28,6 @@ from typing import Any
 
 from langchain.agents import create_agent
 from langchain.messages import SystemMessage
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool as lc_tool
 
@@ -33,6 +38,7 @@ from harnesses.common import (
     SYSTEM_PROMPT,
     TEMPERATURE,
 )
+from harnesses.openai_common import get_openai_model, is_reasoning_model
 from tasks.registry import Task, Trajectory
 from tools import execute as tools_execute
 
@@ -84,24 +90,27 @@ def _build_tools(scratch_dir: Path) -> list:
     return [bash, read_file, write_file, edit_file, list_dir, finish]
 
 
-def run(task: Task, scratch_dir: Path) -> Trajectory:
-    traj = Trajectory()
+def _build_model_and_system(provider: str) -> tuple[Any, Any]:
+    """Return (chat_model, system_prompt) for create_agent.
 
-    model = ChatAnthropic(
-        model=MODEL,
-        temperature=TEMPERATURE,
-        max_tokens=MAX_TOKENS_PER_CALL,
-    )
-    # Pass the system prompt as a SystemMessage (not a plain string) so we can
-    # attach Anthropic `cache_control` to the content block. This mirrors the
-    # thin and langgraph harnesses, which both cache the system prompt via
-    # `cache_control: {"type": "ephemeral"}` — without it, this harness would
-    # re-send the full system prompt uncached on every turn, inflating tokens_in
-    # relative to the others and muddying the fairness comparison.
-    agent = create_agent(
-        model,
-        _build_tools(scratch_dir),
-        system_prompt=SystemMessage(
+    Imports the provider-specific `ChatX` lazily so a missing optional
+    LangChain integration only matters if you actually use that provider.
+    """
+    if provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+
+        model = ChatAnthropic(
+            model=MODEL,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS_PER_CALL,
+        )
+        # Pass the system prompt as a SystemMessage (not a plain string) so we
+        # can attach Anthropic `cache_control` to the content block. This
+        # mirrors the thin and langgraph harnesses, which both cache the
+        # system prompt via `cache_control: {"type": "ephemeral"}` — without
+        # it, this harness would re-send the full system prompt uncached on
+        # every turn, inflating tokens_in relative to the others.
+        system = SystemMessage(
             content=[
                 {
                     "type": "text",
@@ -109,8 +118,43 @@ def run(task: Task, scratch_dir: Path) -> Trajectory:
                     "cache_control": {"type": "ephemeral"},
                 }
             ]
-        ),
+        )
+        return model, system
+
+    if provider == "openai":
+        from langchain_openai import ChatOpenAI
+
+        model_name = get_openai_model()
+        chat_kwargs: dict = {"model": model_name}
+        if is_reasoning_model(model_name):
+            # Reasoning models reject `temperature` and use
+            # `max_completion_tokens` in place of `max_tokens`.
+            chat_kwargs["max_completion_tokens"] = MAX_TOKENS_PER_CALL
+        else:
+            chat_kwargs["temperature"] = TEMPERATURE
+            chat_kwargs["max_tokens"] = MAX_TOKENS_PER_CALL
+        model = ChatOpenAI(**chat_kwargs)
+        # OpenAI has no cache-control marker; plain string is fine.
+        return model, SYSTEM_PROMPT
+
+    if provider == "gemini":
+        raise NotImplementedError(
+            "langgraph_react --provider gemini is not yet implemented. "
+            "Add `langchain-google-genai` to pyproject.toml and dispatch to "
+            "ChatGoogleGenerativeAI here. (`thin --provider gemini` already "
+            "works via google-genai directly.)"
+        )
+
+    raise ValueError(
+        f"unknown provider {provider!r}; expected one of: anthropic, openai, gemini"
     )
+
+
+def run(task: Task, scratch_dir: Path, provider: str = "anthropic") -> Trajectory:
+    traj = Trajectory()
+
+    model, system = _build_model_and_system(provider)
+    agent = create_agent(model, _build_tools(scratch_dir), system_prompt=system)
 
     # LangGraph's recursion_limit counts total graph steps (agent node + tool
     # node pairs). Each "turn" in our other harnesses corresponds to one agent
@@ -139,6 +183,9 @@ def run(task: Task, scratch_dir: Path) -> Trajectory:
             traj.tokens_in += int(usage.get("input_tokens", 0) or 0)
             traj.tokens_out += int(usage.get("output_tokens", 0) or 0)
             details = usage.get("input_token_details") or {}
+            # Anthropic reports cache_read/cache_creation here; OpenAI reports
+            # only cache_read (and only on the official endpoint). Fields
+            # missing for a provider just stay 0.
             traj.cache_read += int(details.get("cache_read", 0) or 0)
             traj.cache_write += int(details.get("cache_creation", 0) or 0)
 
